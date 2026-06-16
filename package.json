@@ -2,7 +2,7 @@
   "name": "cursor-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "飞书 ↔ Cursor Agent（含定时任务）+ real-browser MCP",
+  "description": "飞书 ↔ Cursor Agent bridge（含 /schedule 定时任务）",
   "type": "module",
   "bin": {
     "lark-channel-bridge": "./bin/lark-channel-bridge.mjs"
@@ -37,7 +37,6 @@
     "@types/node": "^22.10.0",
     "@types/proper-lockfile": "^4.1.4",
     "@types/qrcode-terminal": "^0.12.2",
-    "real-browser-mcp": "1.2.1",
     "tsup": "^8.3.5",
     "typescript": "^5.6.3",
     "vitest": "^2.1.8"
