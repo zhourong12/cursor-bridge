@@ -1,0 +1,6 @@
+# 工作区：D:\new-code\cursor-bridge
+
+- **路径**：`D:\new-code\cursor-bridge`（`D:\new-code` 下子目录）
+- **飞书 `/cd`**：`/cd D:\new-code\cursor-bridge`
+- **启动**：`npm run lark-bridge:cursor` 或 `npm run lark-bridge:restart`（均会自动 build）
+- **bridge 源码**：本仓库 `src/`（非 vendor）
