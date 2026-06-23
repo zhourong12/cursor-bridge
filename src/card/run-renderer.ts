@@ -49,7 +49,7 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   }
 
   if (state.terminal === 'running') {
-    if (state.footer) elements.push(footerStatus(state.footer));
+    if (state.footer) elements.push(footerStatus(state.footer, elapsedSeconds(state)));
     elements.push(stopButton(options));
   }
 
@@ -193,14 +193,22 @@ function stopButton(options: RunCardRenderOptions): object {
   };
 }
 
-function footerStatus(status: Exclude<FooterStatus, null>): object {
-  const text =
+function footerStatus(status: Exclude<FooterStatus, null>, elapsedSec?: number): object {
+  const base =
     status === 'thinking'
       ? '🧠 正在思考'
       : status === 'tool_running'
         ? '🧰 正在调用工具'
         : '✍️ 正在输出';
+  const text =
+    elapsedSec !== undefined && elapsedSec >= 5 ? `${base} (${elapsedSec}s)` : base;
   return noteMd(text);
+}
+
+/** Whole seconds since the run started, or undefined when start time is unknown. */
+function elapsedSeconds(state: RunState): number | undefined {
+  if (!state.startedAt) return undefined;
+  return Math.floor((Date.now() - state.startedAt) / 1000);
 }
 
 function summaryText(state: RunState): string {

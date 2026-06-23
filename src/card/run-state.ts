@@ -26,6 +26,10 @@ export interface RunState {
   /** Set when terminal === 'idle_timeout' — how long claude was idle before
    * the watchdog gave up (so the message can say "N 分钟无响应"). */
   idleTimeoutMinutes?: number;
+  /** Epoch ms when the run started. 0 means "not started yet" (the shared
+   * `initialState` sentinel); the real value is injected per-run so the footer
+   * can show elapsed time. */
+  startedAt: number;
 }
 
 export const initialState: RunState = {
@@ -33,6 +37,7 @@ export const initialState: RunState = {
   reasoning: { content: '', active: false },
   footer: 'thinking',
   terminal: 'running',
+  startedAt: 0,
 };
 
 function closeStreamingText(blocks: Block[]): Block[] {

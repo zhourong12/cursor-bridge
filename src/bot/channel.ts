@@ -73,6 +73,7 @@ import type { MessageLifecycleStage } from './lifecycle';
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
+const HEARTBEAT_MS = 10_000;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
@@ -925,11 +926,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   let streamStarted = false;
   try {
     if (replyMode === 'card') {
-      let latestState: RunState = initialState;
+      let latestState: RunState = { ...initialState, startedAt: Date.now() };
       let producerStarted = false;
       let cardCtrl:
         | { update(next: object | ((current: object) => object)): Promise<void> }
         | undefined;
+      // Serialize card updates: the event-driven flush and the heartbeat timer
+      // both call cardCtrl.update; skip a heartbeat tick while one is in flight.
+      let cardUpdateInFlight = false;
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -943,7 +948,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           }
           latestState = state;
           if (cardCtrl) {
-            await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+            cardUpdateInFlight = true;
+            try {
+              await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+            } finally {
+              cardUpdateInFlight = false;
+            }
           }
         },
       );
@@ -951,12 +961,29 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         chatId,
         {
           card: {
-            initial: renderCard(initialState, cardRenderOptions),
+            initial: renderCard(latestState, cardRenderOptions),
             producer: async (ctrl) => {
               producerStarted = true;
               cardCtrl = ctrl;
               await ctrl.update(renderCard(filterForPrefs(latestState), cardRenderOptions));
-              await renderDone;
+              // Heartbeat: while the run is live, refresh the card every 10s so
+              // the footer's elapsed timer ticks even when the agent is silent.
+              heartbeatTimer = setInterval(() => {
+                if (latestState.terminal !== 'running' || !cardCtrl || cardUpdateInFlight) return;
+                cardUpdateInFlight = true;
+                void cardCtrl
+                  .update(renderCard(filterForPrefs(latestState), cardRenderOptions))
+                  .catch(() => {})
+                  .finally(() => {
+                    cardUpdateInFlight = false;
+                  });
+              }, HEARTBEAT_MS);
+              try {
+                await renderDone;
+              } finally {
+                if (heartbeatTimer) clearInterval(heartbeatTimer);
+                heartbeatTimer = undefined;
+              }
             },
           },
         },
@@ -1066,7 +1093,7 @@ async function processAgentStream(
   flush: (state: RunState) => Promise<void>,
 ): Promise<RunState> {
   const runStart = Date.now();
-  let state: RunState = initialState;
+  let state: RunState = { ...initialState, startedAt: runStart };
 
   // Idle watchdog: claude going silent for `idleTimeoutMs` is treated as
   // "presumed hung", we stop() and surface a timeout marker on the card.

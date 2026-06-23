@@ -5,6 +5,7 @@ import pkg from '../../../package.json';
 import { ClaudeAdapter } from '../../agent/claude/adapter';
 import { CodexAdapter } from '../../agent/codex/adapter';
 import { CursorAdapter } from '../../agent/cursor/adapter';
+import { cleanupStaleCursorRuns } from '../../agent/cursor/stale-run-cleanup';
 import {
   AgentPreflightError,
   formatAgentPreflightDiagnostic,
@@ -146,6 +147,10 @@ export async function runStart(opts: StartOptions): Promise<void> {
           await sessionCatalog.load();
           const workspaces = new WorkspaceStore(appPaths.workspacesFile);
           await workspaces.load();
+
+          if ((cfg.agentKind ?? profileConfig.agentKind) === 'cursor') {
+            await cleanupStaleCursorRuns(sessionCatalog);
+          }
 
         await gcMediaCache(MEDIA_GC_MAX_AGE_MS, appPaths.mediaDir);
         await gcOldLogs();

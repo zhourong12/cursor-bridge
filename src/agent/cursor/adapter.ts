@@ -11,6 +11,7 @@ import type {
   SDKMessage,
 } from '@cursor/sdk';
 
+import { log } from '../../core/logger';
 import { prefixBridgeSystemPrompt } from '../bridge-system-prompt';
 import { AgentPreflightError, type AgentAvailability } from '../preflight';
 import type {
@@ -21,10 +22,17 @@ import type {
   AgentRunOptions,
 } from '../types';
 import { loadAlwaysApplyCursorRules } from './rules';
+import {
+  isActiveRunConflict,
+  releaseAgentRunLockIfTerminal,
+  sendWithActiveRunRetry,
+} from './stale-run-cleanup';
 
 const DEFAULT_CURSOR_MODEL = 'default';
 const RUN_POLL_MS = 100;
 const RUN_POLL_MAX_MS = 30_000;
+const MAX_RUN_ATTEMPTS = 2;
+const RETRY_BACKOFF_MS = 3000;
 
 export type CursorAgentCreate = (options: AgentOptions) => Promise<SDKAgent>;
 export type CursorAgentResume = (agentId: string, options?: Partial<AgentOptions>) => Promise<SDKAgent>;
@@ -97,6 +105,11 @@ export class CursorAdapter implements AgentAdapter {
     return { ok: false, error, diagnostic };
   }
 
+  async prepareRun(opts: AgentRunOptions): Promise<void> {
+    if (!opts.sessionId || !opts.cwd) return;
+    await releaseAgentRunLockIfTerminal(opts.sessionId, opts.cwd);
+  }
+
   run(opts: AgentRunOptions): AgentRun {
     let activeRun: Run | undefined;
     let stopRequested = false;
@@ -145,9 +158,11 @@ export class CursorAdapter implements AgentAdapter {
       modelSelection(opts.model ?? this.model ?? DEFAULT_CURSOR_MODEL),
     );
     let agent: SDKAgent | undefined;
+    let cwd: string | undefined;
     try {
       const target = await this.resolveAgentTarget(apiKey, model, opts);
       agent = target.agent;
+      cwd = target.cwd;
 
       yield {
         type: 'system',
@@ -158,23 +173,92 @@ export class CursorAdapter implements AgentAdapter {
 
       const projectRules = await this.loadRules(opts.cwd);
       const prompt = prefixBridgeSystemPrompt(opts.prompt, this.botIdentity, projectRules);
-      let run!: Run;
-      yield* streamLiveRun(agent, target.cwd, prompt, runState, (resolved) => {
-        run = resolved;
-      });
-      const result = await run.wait();
-      const errorDetail =
-        result.status === 'error' && !result.result?.trim()
-          ? await readRunErrorDetail(target.cwd, run.id)
-          : undefined;
-      yield terminalEvent(agent.agentId, result, errorDetail);
+      const isResume = Boolean(opts.sessionId);
+
+      const runResult = yield* this.attemptRun(agent, target.cwd, prompt, runState);
+
+      if (runResult === 'ok') return;
+
+      if (runResult === 'retryable' && !isResume) {
+        log.warn('cursor', 'run-retry-same-agent', { agentId: agent.agentId });
+        await releaseAgentRunLockIfTerminal(agent.agentId, target.cwd);
+        await delay(RETRY_BACKOFF_MS);
+        const retryResult = yield* this.attemptRun(agent, target.cwd, prompt, runState);
+        if (retryResult !== 'ok') {
+          yield terminalError('运行失败，请发 /new 开新会话后重试。');
+        }
+        return;
+      }
+
+      if (runResult === 'retryable' && isResume) {
+        log.warn('cursor', 'run-fallback-fresh', { stalledAgent: agent.agentId, cwd: target.cwd });
+        await releaseAgentRunLockIfTerminal(agent.agentId, target.cwd);
+        await disposeAgent(agent);
+        await delay(RETRY_BACKOFF_MS);
+
+        const freshAgent = await this.createAgent({ apiKey, model, local: { cwd: target.cwd } });
+        agent = freshAgent;
+        yield { type: 'system', sessionId: freshAgent.agentId, cwd: target.cwd, model: model.id };
+
+        const freshResult = yield* this.attemptRun(freshAgent, target.cwd, prompt, runState);
+        if (freshResult !== 'ok') {
+          yield terminalError('新会话也运行失败，请检查 Cursor IDE 是否正常。');
+        }
+        return;
+      }
     } catch (err) {
       yield terminalError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (agent) {
+      if (agent && cwd) {
+        await releaseAgentRunLockIfTerminal(agent.agentId, cwd);
         await disposeAgent(agent);
       }
     }
+  }
+
+  private async *attemptRun(
+    agent: SDKAgent,
+    cwd: string,
+    prompt: string,
+    runState: { setActiveRun(run: Run): void; shouldStop(): boolean },
+  ): AsyncGenerator<AgentEvent, 'ok' | 'retryable' | 'fatal'> {
+    let sawOutput = false;
+    let run: Run | undefined;
+
+    try {
+      for await (const ev of streamLiveRun(agent, cwd, prompt, runState, (resolved) => {
+        run = resolved;
+      })) {
+        if (ev.type === 'error') {
+          if (!sawOutput && isRetryableRunError(ev.message)) return 'retryable';
+          yield ev;
+          return 'fatal';
+        }
+        if (isOutputEvent(ev)) sawOutput = true;
+        yield ev;
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (!sawOutput && isRetryableRunError(errMsg)) return 'retryable';
+      yield terminalError(formatRunFailureMessage(run?.id ?? 'unknown', undefined, errMsg));
+      return 'fatal';
+    }
+
+    if (!run) return 'ok';
+    const result = await run.wait();
+    if (result.status !== 'error') {
+      yield terminalEvent(agent.agentId, result);
+      return 'ok';
+    }
+
+    const errorDetail = !result.result?.trim()
+      ? await readRunErrorDetail(cwd, agent.agentId, run.id)
+      : undefined;
+    if (!sawOutput && isRetryableRunError(result.result?.trim() || errorDetail)) {
+      return 'retryable';
+    }
+    yield terminalEvent(agent.agentId, result, errorDetail);
+    return 'fatal';
   }
 
   private resolveApiKey(): string | undefined {
@@ -264,13 +348,18 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForActiveLocalRun(agentId: string, cwd: string): Promise<Run | undefined> {
+async function waitForActiveLocalRun(
+  agentId: string,
+  cwd: string,
+  sendStartedAt: number,
+): Promise<Run | undefined> {
   const deadline = Date.now() + RUN_POLL_MAX_MS;
   while (Date.now() < deadline) {
     try {
       const runs = await Agent.listRuns(agentId, { runtime: 'local', cwd, limit: 10 });
       const active = runs.items
         .filter((entry) => entry.status === 'running')
+        .filter((entry) => !entry.createdAt || entry.createdAt >= sendStartedAt - 1000)
         .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0];
       if (active) return Agent.getRun(active.id, { runtime: 'local', cwd });
     } catch {
@@ -297,12 +386,13 @@ async function* streamLiveRun(
   },
   setRun: (run: Run) => void,
 ): AsyncGenerator<AgentEvent> {
-  const sendPromise = agent.send(prompt);
+  const sendStartedAt = Date.now();
+  const sendPromise = sendWithActiveRunRetry(agent, cwd, prompt);
   let earlyRun: Run | undefined;
   let streamedEarly = false;
 
   try {
-    earlyRun = await waitForActiveLocalRun(agent.agentId, cwd);
+    earlyRun = await waitForActiveLocalRun(agent.agentId, cwd, sendStartedAt);
     if (earlyRun) {
       runState.setActiveRun(earlyRun);
       if (runState.shouldStop() && earlyRun.supports('cancel')) {
@@ -321,6 +411,12 @@ async function* streamLiveRun(
   try {
     run = await sendPromise;
   } catch (err) {
+    if (isActiveRunConflict(err)) {
+      yield terminalError(
+        '会话中存在未结束的 Cursor 运行，已尝试清理仍未成功。请发 /stop 后重试；仍失败可 /new 开新会话。',
+      );
+      return;
+    }
     yield terminalError(err instanceof Error ? err.message : String(err));
     return;
   }
@@ -337,6 +433,11 @@ async function* streamLiveRun(
 async function* streamRunEvents(run: Run): AsyncGenerator<AgentEvent> {
   if (!run.supports('stream')) return;
   for await (const message of run.stream()) {
+    if (message.type === 'status' && message.status === 'ERROR') {
+      // Stop streaming and let run.wait()/store surface the failure detail so
+      // the retry path in createEventStream can decide whether to retry.
+      return;
+    }
     yield* translateSdkMessage(message);
   }
 }
@@ -388,6 +489,21 @@ function* translateSdkMessage(message: SDKMessage): Generator<AgentEvent> {
   }
 }
 
+function isOutputEvent(ev: AgentEvent): boolean {
+  return ev.type !== 'system' && ev.type !== 'error' && ev.type !== 'done';
+}
+
+/**
+ * Retryable when there is no detail (bare ERROR) or the failure is a transport
+ * stall. Only used when the attempt produced no output, so re-sending the same
+ * prompt cannot duplicate visible work.
+ */
+function isRetryableRunError(detail?: string): boolean {
+  const text = detail?.trim();
+  if (!text) return true;
+  return /Connection stalled|NGHTTP2_ENHANCE_YOUR_CALM|ECANCELED/i.test(text);
+}
+
 function terminalEvent(agentId: string, result: RunResult, errorDetail?: string): AgentEvent {
   switch (result.status) {
     case 'finished':
@@ -409,18 +525,28 @@ function formatRunFailureMessage(
   errorDetail?: string,
 ): string {
   const detail = result?.trim() || errorDetail?.trim();
-  if (detail === 'Connection stalled') {
-    return '网络连接超时（Connection stalled），拉取外部数据时中断。请稍后重试；若反复出现请检查网络或代理。';
+  if (detail && isActiveRunConflict(detail)) {
+    return '会话中存在未结束的 Cursor 运行。请再发一次；仍失败可发 /stop 或 /new。';
+  }
+  if (
+    detail === 'Connection stalled' ||
+    /NGHTTP2_ENHANCE_YOUR_CALM|ECANCELED/.test(detail ?? '')
+  ) {
+    return '网络连接中断（HTTP/2 传输层错误），正在自动重试。若反复出现请发 /new 开新会话。';
   }
   if (detail) return `${detail} (run id: ${runId})`;
   return `Cursor Agent 运行失败 (run id: ${runId})，请重试`;
 }
 
-async function readRunErrorDetail(cwd: string, runId: string): Promise<string | undefined> {
+async function readRunErrorDetail(
+  cwd: string,
+  agentId: string,
+  runId: string,
+): Promise<string | undefined> {
   try {
     const store = await SqliteLocalAgentStore.open({ workspaceRef: cwd });
     try {
-      const doc = await store.runs.get({ runId });
+      const doc = await store.runs.get({ agentId, runId });
       return doc?.error?.trim() || undefined;
     } finally {
       await store.dispose();
