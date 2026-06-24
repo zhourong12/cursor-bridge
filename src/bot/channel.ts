@@ -10,6 +10,7 @@ import {
   codexCapability,
   cursorCapability,
 } from '../agent/capability';
+import { BRIDGE_AUTH_INSTRUCTION_BULLETS } from '../agent/bridge-auth-rules';
 import {
   buildAgentPrompt,
   type BridgePromptInteractiveCard,
@@ -67,6 +68,9 @@ import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, type QuotedContext } from './quote';
 import { addWorkingReaction, removeReaction } from './reaction';
+import { extractLocalImagePaths, sendSupplementaryImages } from './supplementary-images';
+import { deliverSupplementaryAuthOnce, type AuthDeliveryGate } from './supplementary-auth';
+import { toolOutputNeedsAuthDelivery } from '../agent/bridge-auth-rules';
 import { fetchKnownChats } from './lark-info';
 import type { MessageLifecycleStage } from './lifecycle';
 
@@ -81,6 +85,7 @@ const BRIDGE_AGENT_INSTRUCTIONS = [
   'Codex bridge 默认使用 danger-full-access 对齐 Claude bridge 的 bypassPermissions 行为，因此 lark-cli 应能像用户本机终端一样访问 keychain。',
   '如果提示 lark-channel context detected but not bound，停止当前操作并请用户重启 bridge 或运行 bridge doctor/preflight；不要改用普通 profile，不要自行 bind，也不要直接读取 config.json 里的账号或密钥。',
   '本 fork 支持 /schedule 定时任务（进程内调度）。用户问定时/周期执行时，引导其发送 /schedule add <cron五段> <prompt>，不要说「不支持」或让用户去配 Windows 计划任务。',
+  ...BRIDGE_AUTH_INSTRUCTION_BULLETS,
 ];
 
 // Lark SDK logs API errors at error level even when the caller catches them.
@@ -894,6 +899,27 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const replyMode = getMessageReplyMode(controls.cfg);
   log.info('flush', 'reply-mode', { mode: replyMode });
 
+  const appPaths = resolveAppPaths({ profile: controls.profile });
+  const authDeliveryGate: AuthDeliveryGate = { delivered: false };
+  const authDeliveryBase = {
+    channel,
+    chatId,
+    sendOpts,
+    profileDir: appPaths.profileDir,
+    larkCliConfigDir: appPaths.larkCliConfigDir,
+  };
+  const onAuthToolOutput = async (output: string): Promise<void> => {
+    await deliverSupplementaryAuthOnce(authDeliveryGate, authDeliveryBase, [output]);
+  };
+  const finalizeAuthDelivery = async (state: RunState): Promise<void> => {
+    const runTexts = state.blocks.flatMap((b) => {
+      if (b.kind === 'tool' && b.tool.output) return [b.tool.output];
+      if (b.kind === 'text' && b.content) return [b.content];
+      return [];
+    });
+    await deliverSupplementaryAuthOnce(authDeliveryGate, authDeliveryBase, runTexts);
+  };
+
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
   const filterForPrefs = (state: RunState): RunState => {
@@ -956,6 +982,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             }
           }
         },
+        undefined,
+        undefined,
+        onAuthToolOutput,
       );
       const streamDone = channel.stream(
         chatId,
@@ -1002,10 +1031,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           );
         },
       });
+      await finalizeAuthDelivery(await renderDone);
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let producerStarted = false;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
+      const supplementaryImages = new Set<string>();
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -1022,6 +1053,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await markdownCtrl.setContent(renderText(filterForPrefs(state)));
           }
         },
+        supplementaryImages,
+        cwd,
+        onAuthToolOutput,
       );
       const streamDone = channel.stream(
         chatId,
@@ -1047,6 +1081,24 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           }
         },
       });
+      const finalState = await renderDone;
+      await finalizeAuthDelivery(finalState);
+      const imageCount = await sendSupplementaryImages({
+        channel,
+        chatId,
+        sendOpts,
+        cwd,
+        profileDir: appPaths.profileDir,
+        larkCliConfigDir: appPaths.larkCliConfigDir,
+        runStartedAt: finalState.startedAt || Date.now(),
+        stateToolOutputs: finalState.blocks.flatMap((b) =>
+          b.kind === 'tool' && b.tool.output ? [b.tool.output] : [],
+        ),
+        collectedPaths: supplementaryImages,
+      });
+      if (imageCount > 0) {
+        log.info('supplementary-image', 'batch-sent', { count: imageCount });
+      }
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -1058,11 +1110,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         idleTimeoutMs,
         recordSession,
         async () => {},
+        undefined,
+        undefined,
+        onAuthToolOutput,
       );
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
         await channel.send(chatId, { markdown: body }, sendOpts);
       }
+      await finalizeAuthDelivery(finalState);
     }
   } catch (err) {
     streamFailed = true;
@@ -1091,6 +1147,9 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
+  supplementaryImages?: Set<string>,
+  cwd?: string,
+  onAuthToolOutput?: (output: string) => Promise<void>,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = { ...initialState, startedAt: runStart };
@@ -1144,6 +1203,16 @@ async function processAgentStream(
       } else if (evt.type === 'tool_result') {
         inFlightTools.delete(evt.id);
         log.info('agent', 'tool-done', { inFlight: inFlightTools.size });
+        if (supplementaryImages && cwd && evt.output) {
+          for (const path of extractLocalImagePaths(evt.output, cwd)) {
+            supplementaryImages.add(path);
+          }
+        }
+        if (onAuthToolOutput && evt.output && toolOutputNeedsAuthDelivery(evt.output)) {
+          void onAuthToolOutput(evt.output).catch((err) => {
+            log.fail('supplementary-auth', err, { step: 'tool-result' });
+          });
+        }
       }
       armOrPauseIdle();
 

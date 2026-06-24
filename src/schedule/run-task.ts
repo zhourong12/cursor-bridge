@@ -26,7 +26,7 @@ async function collectAssistantText(events: AsyncIterable<AgentEvent>): Promise<
 
 export async function runScheduledTask(deps: RunScheduledTaskDeps, task: ScheduledTask, slot: string): Promise<void> {
   const cwd = task.cwd ?? deps.defaultCwd;
-  log.info('schedule', 'run-start', { id: task.id, chatId: task.chatId, slot });
+  log.info('schedule', 'run-start', { id: task.id, chatId: task.chatId, slot, silent: !!task.silent });
 
   try {
     const run = deps.agent.run({
@@ -36,24 +36,28 @@ export async function runScheduledTask(deps: RunScheduledTaskDeps, task: Schedul
       model: deps.model,
     });
     const text = await collectAssistantText(run.events);
-    const body = text || '（任务已完成，无文本输出）';
-    await deps.channel.send(task.chatId, {
-      markdown: `**定时任务** \`${task.id}\`\n\n${body}`,
-    });
+    if (!task.silent) {
+      const body = text || '（任务已完成，无文本输出）';
+      await deps.channel.send(task.chatId, {
+        markdown: `**定时任务** \`${task.id}\`\n\n${body}`,
+      });
+    }
     await updateTask(deps.profileDir, task.id, {
       lastRunAt: new Date().toISOString(),
       lastRunSlot: slot,
     });
-    log.info('schedule', 'run-ok', { id: task.id, slot });
+    log.info('schedule', 'run-ok', { id: task.id, slot, silent: !!task.silent });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log.fail('schedule', err, { id: task.id, step: 'run' });
-    try {
-      await deps.channel.send(task.chatId, {
-        markdown: `**定时任务失败** \`${task.id}\`\n\n${message}`,
-      });
-    } catch (sendErr) {
-      log.fail('schedule', sendErr, { id: task.id, step: 'notify-fail' });
+    if (!task.silent) {
+      try {
+        await deps.channel.send(task.chatId, {
+          markdown: `**定时任务失败** \`${task.id}\`\n\n${message}`,
+        });
+      } catch (sendErr) {
+        log.fail('schedule', sendErr, { id: task.id, step: 'notify-fail' });
+      }
     }
     await updateTask(deps.profileDir, task.id, { lastRunSlot: slot });
   }

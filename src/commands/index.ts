@@ -73,6 +73,7 @@ import { createBoundChat, defaultChatName } from '../bot/group';
 import { fetchKnownChats, type KnownChat } from '../bot/lark-info';
 import { applyLarkCliIdentityPolicy, hasStructuredLarkCliUserAuth } from '../lark-cli/identity-policy';
 import { mergeProcessEnv, spawnProcess } from '../platform/spawn';
+import { sendLarkCliBotImage } from '../bot/lark-cli-im';
 import { handleSchedule } from './schedule.js';
 
 export interface Controls {
@@ -914,16 +915,7 @@ interface LarkAuthPending {
 async function handleLarkAuth(args: string, ctx: CommandContext): Promise<void> {
   const trimmed = args.trim();
   if (!trimmed) {
-    await reply(
-      ctx,
-      [
-        '用法：',
-        '- `/lark-auth calendar,im,docs` 发起 profile-local 用户授权',
-        '- `/lark-auth scope calendar:calendar:readonly` 按 scope 发起授权',
-        '- `/lark-auth done` 在你完成网页授权后收尾',
-        '- `/lark-auth status` 查看当前 profile 的 lark-cli 授权状态',
-      ].join('\n'),
-    );
+    await startLarkAuth(ctx, { recommend: true });
     return;
   }
 
@@ -936,19 +928,41 @@ async function handleLarkAuth(args: string, ctx: CommandContext): Promise<void> 
     return;
   }
 
-  await startLarkAuth(trimmed, ctx);
+  await startLarkAuth(ctx, { target: trimmed });
 }
 
-async function startLarkAuth(rawTarget: string, ctx: CommandContext): Promise<void> {
-  const target = parseLarkAuthTarget(rawTarget);
-  if (!target) {
-    await reply(ctx, '授权目标不能为空。示例：`/lark-auth calendar,im,docs` 或 `/lark-auth scope calendar:calendar:readonly`');
-    return;
+async function startLarkAuth(
+  ctx: CommandContext,
+  opts: { recommend?: boolean; target?: string },
+): Promise<void> {
+  let loginArgs: string[];
+  let requestKind: LarkAuthPending['requestKind'];
+  let requestValue: string;
+
+  if (opts.recommend) {
+    loginArgs = ['auth', 'login', '--recommend', '--no-wait', '--json'];
+    requestKind = 'scope';
+    requestValue = 'recommend';
+  } else {
+    const target = parseLarkAuthTarget(opts.target ?? '');
+    if (!target) {
+      await reply(
+        ctx,
+        '授权目标不能为空。示例：`/lark-auth`（推荐 scope）、`/lark-auth calendar,im,docs` 或 `/lark-auth scope calendar:calendar:readonly`',
+      );
+      return;
+    }
+    loginArgs = ['auth', 'login', `--${target.kind}`, target.value, '--no-wait', '--json'];
+    requestKind = target.kind;
+    requestValue = target.value;
   }
 
   const paths = larkAuthPaths(ctx);
+  const appPaths = commandProfilePaths(ctx);
   await mkdir(paths.authDir, { recursive: true });
-  const result = await runLarkCli(ctx, ['auth', 'login', `--${target.kind}`, target.value, '--no-wait', '--json']);
+  await runLarkCli(ctx, ['config', 'strict-mode', 'off']);
+  await runLarkCli(ctx, ['config', 'default-as', 'auto']);
+  const result = await runLarkCli(ctx, loginArgs);
   const json = parseJsonObject(result.stdout);
   if (result.exitCode !== 0 || !json) {
     await reply(ctx, `发起授权失败：${shortCommandOutput(result)}`);
@@ -972,8 +986,8 @@ async function startLarkAuth(rawTarget: string, ctx: CommandContext): Promise<vo
         deviceCode,
         verificationUrl,
         ...(stringField(json, 'user_code') ? { userCode: stringField(json, 'user_code') } : {}),
-        requestKind: target.kind,
-        requestValue: target.value,
+        requestKind,
+        requestValue,
         createdAt: new Date().toISOString(),
       } satisfies LarkAuthPending,
       null,
@@ -985,11 +999,6 @@ async function startLarkAuth(rawTarget: string, ctx: CommandContext): Promise<vo
   const qrResult = await runLarkCli(ctx, ['auth', 'qrcode', verificationUrl, '--output', './lark-auth-qrcode.png'], {
     cwd: paths.authDir,
   });
-  const qrLine =
-    qrResult.exitCode === 0
-      ? `二维码文件：\`${paths.qrcodeFile}\``
-      : `二维码生成失败：${shortCommandOutput(qrResult)}`;
-
   await reply(
     ctx,
     [
@@ -997,18 +1006,29 @@ async function startLarkAuth(rawTarget: string, ctx: CommandContext): Promise<vo
       '',
       verificationUrl,
       '',
-      qrLine,
-      '',
       '请完成网页授权后，回到飞书发送：`/lark-auth done`',
     ].join('\n'),
   );
+
+  if (qrResult.exitCode === 0) {
+    const sent = await sendLarkCliBotImage({
+      larkCliConfigDir: appPaths.larkCliConfigDir,
+      chatId: ctx.msg.chatId,
+      imagePath: paths.qrcodeFile,
+    });
+    if (!sent) {
+      await reply(ctx, '二维码上传失败，请直接打开上方链接完成授权。');
+    }
+  } else {
+    await reply(ctx, `二维码生成失败：${shortCommandOutput(qrResult)}`);
+  }
 }
 
 async function completeLarkAuth(ctx: CommandContext): Promise<void> {
   const paths = larkAuthPaths(ctx);
-  let pending: LarkAuthPending;
+  let raw: string;
   try {
-    pending = JSON.parse(await readFile(paths.pendingFile, 'utf8')) as LarkAuthPending;
+    raw = await readFile(paths.pendingFile, 'utf8');
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
       await reply(ctx, '没有待完成的 lark-cli 授权。请先发送 `/lark-auth calendar,im,docs`。');
@@ -1017,6 +1037,27 @@ async function completeLarkAuth(ctx: CommandContext): Promise<void> {
     throw err;
   }
 
+  const pendingJson = parseJsonObject(raw);
+  const deviceCode =
+    stringField(pendingJson, 'deviceCode') ?? stringField(pendingJson, 'device_code');
+  if (!deviceCode) {
+    await reply(ctx, '待完成的授权记录无效或已损坏，请重新发送 `/lark-auth calendar,im,docs`。');
+    return;
+  }
+  const pending: LarkAuthPending = {
+    deviceCode,
+    verificationUrl:
+      stringField(pendingJson, 'verificationUrl') ??
+      stringField(pendingJson, 'verification_url') ??
+      '',
+    userCode: stringField(pendingJson, 'userCode') ?? stringField(pendingJson, 'user_code'),
+    requestKind: stringField(pendingJson, 'requestKind') as LarkAuthPending['requestKind'],
+    requestValue: stringField(pendingJson, 'requestValue'),
+    createdAt: stringField(pendingJson, 'createdAt') ?? '',
+  };
+
+  await runLarkCli(ctx, ['config', 'strict-mode', 'off']);
+  await runLarkCli(ctx, ['config', 'default-as', 'auto']);
   const result = await runLarkCli(ctx, ['auth', 'login', '--device-code', pending.deviceCode, '--json']);
   const json = parseJsonObject(result.stdout);
   const complete = json && stringField(json, 'event') === 'authorization_complete';
@@ -1125,7 +1166,7 @@ async function runLarkCli(
 
 function parseJsonObject(text: string): Record<string, unknown> | undefined {
   try {
-    const parsed = JSON.parse(text) as unknown;
+    const parsed = JSON.parse(text.replace(/^\uFEFF/, '').trim()) as unknown;
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : undefined;

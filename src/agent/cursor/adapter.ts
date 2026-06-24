@@ -534,6 +534,9 @@ function formatRunFailureMessage(
   ) {
     return '网络连接中断（HTTP/2 传输层错误），正在自动重试。若反复出现请发 /new 开新会话。';
   }
+  if (/WritableIterable is closed/i.test(detail ?? '')) {
+    return '运行因 OAuth 阻塞或长时间无输出被中断。请私聊发 `/lark-auth` 完成授权，再发 `/lark-auth done` 后重试原任务。';
+  }
   if (detail) return `${detail} (run id: ${runId})`;
   return `Cursor Agent 运行失败 (run id: ${runId})，请重试`;
 }

@@ -10,6 +10,8 @@ export interface ScheduledTask {
   lastRunAt?: string;
   /** YYYY-MM-DDTHH:mm slot key — prevents double-fire in the same minute */
   lastRunSlot?: string;
+  /** When true, do not post schedule results to Feishu (background maintenance). */
+  silent?: boolean;
 }
 
 export interface ScheduleStore {

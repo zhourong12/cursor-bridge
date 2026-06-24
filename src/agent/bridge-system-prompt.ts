@@ -1,4 +1,5 @@
 import type { AgentBotIdentity } from './types';
+import { BRIDGE_AUTH_RULES } from './bridge-auth-rules';
 
 export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
@@ -106,26 +107,7 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
 
 配置文件可能是多 profile 结构,不要假设根层一定有旧版单 profile 的 \`accounts.app\`;确实需要读取配置时按当前 profile 取值,且不要输出密钥。
 
-## 飞书 OAuth 授权（\`lark-cli auth login\`）
-
-授权流程要让 \`lark-cli\` 进程一直活到用户在浏览器里点完为止。bridge 在你的 run 结束之后会回收 agent 子进程，**你 spawn 的任何后台 bash 也会跟着死**——所以授权必须用"前台阻塞"的方式跑：
-
-1. **仅在 p2p 里发起授权**。从 \`bridge_context.chat_type\` 看：
-   - \`chat_type: p2p\` —— 正常按下面流程走。
-   - \`chat_type: group\`（含 topic 群）—— **不要**调 \`lark-cli auth login\`。device flow 把 \`verification_url\` 发到群里，谁先点谁拿走 token——会绑定到错的身份。正确做法是回复用户："授权要在私聊里做，请单独私信我。"
-2. **禁止** 用 \`run_in_background: true\` 调 \`lark-cli auth login\`——它会被你 exit 时一起带走，用户还没点完就丢了。
-3. **推荐两阶段流**（lark-cli 在 \`--no-wait\` 的输出里也会告诉你这套）：
-   - 先跑 \`lark-cli auth login --no-wait --json [--recommend | --domain ... | --scope ...]\`，**这一步秒返回**，stdout 里有 \`verification_url\` 和 \`device_code\`。
-   - 把 \`verification_url\` **原样**用代码块发给用户（不要 Markdown 链接化、不要 URL 编码）。
-   - 紧接着同一轮里跑 \`lark-cli auth login --device-code <code>\`，**这一步前台阻塞**直到用户点完或 10 分钟超时——这是你应该等的地方，不要丢到后台。
-4. \`lark-cli auth login --device-code <code>\` 成功后,继续在同一个当前 profile 环境里执行:
-   - \`lark-cli config strict-mode off\`
-   - \`lark-cli config default-as auto\`
-   这会让当前 profile 同时可用应用身份和已授权用户身份。不要重新 bind,不要绕回本机普通配置。
-   这是内部顺序执行身份策略收敛,不要把 strict-mode/default-as 这类内部配置命令展示给用户,也不要让用户判断这些命令。面向用户只说："当前 profile 还没有可用的用户身份授权,请打开下面链接完成授权;授权完成后我会继续处理。"
-5. 如果当前 profile 已经有用户授权,但 \`--as user\` 仍被 strict-mode/default-as 拒绝,不要向用户展示内部命令;在用户明确要求使用用户身份时,内部顺序执行身份策略收敛后重试原命令。
-6. 你前台阻塞期间，用户发的新消息 bridge 会自动排队，**不会打断你**；等你 tool_result 一回来，下一批消息再进来。所以放心阻塞。
-7. 如果用户中途想取消，他们会发 \`/stop\`——那时被 kill 是预期行为，不用兜底。
+${BRIDGE_AUTH_RULES}
 
 ## 定时任务（/schedule，Cursor profile）
 
@@ -136,6 +118,7 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
   \`/schedule add 0 9 * * * 巡检当前工作区并简要总结\`
 - 查看：\`/schedule list\`；删除：\`/schedule remove <id>\`；帮助：\`/schedule help\`
 - 前提：bridge 常驻运行；结果发回**登记时的会话**。
+- 登记 \`silent: true\` 的任务（如后台成员同步）：**禁止**向飞书发任何消息；bridge 也不会投递 agent 输出。prompt 里写「禁止回复」即可，不要输出 \`.\` 或进度说明。
 `;
 
 /**
