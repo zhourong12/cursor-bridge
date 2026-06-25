@@ -74,7 +74,7 @@ import { addWorkingReaction, removeReaction } from './reaction';
 import { extractLocalImagePaths, sendSupplementaryImages } from './supplementary-images';
 import { fetchKnownChats } from './lark-info';
 import type { MessageLifecycleStage } from './lifecycle';
-import { fleetPeersForProfile, loadFleetConfig } from '../fleet/load';
+import { fleetPeersForProfile, loadFleetConfig, upsertSelfBot } from '../fleet/load';
 import type { FleetConfig, FleetPeer } from '../fleet/schema';
 import { readAndPrune } from '../runtime/registry';
 import {
@@ -85,6 +85,10 @@ import {
   stripHandoffFromText,
 } from '../fleet/handoff';
 import { sendWithMentions } from './send-with-mentions';
+import {
+  sendAgentMarkdown,
+  tryDispatchReplyMentionsFromState,
+} from './outbound-mentions';
 import { startCursorWatchdog } from './cursor-watchdog';
 import {
   bindBotRuntimeStats,
@@ -490,6 +494,19 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       openId: identity.openId,
       ...(identity.name ? { name: identity.name } : {}),
     });
+    // Record this bot's open_id into fleet.json so /delegate can resolve it
+    // without querying chat members (which doesn't list bots). open_id is
+    // stable per bot per tenant, so one recording covers every chat.
+    try {
+      const changed = await upsertSelfBot(rootDir, {
+        profile: controls.profile,
+        openId: identity.openId,
+        ...(identity.name ? { name: identity.name } : {}),
+      });
+      if (changed) log.info('fleet', 'self-bot-recorded', { profile: controls.profile });
+    } catch (err) {
+      log.warn('fleet', 'self-bot-record-failed', { err: String(err) });
+    }
   }
   const registry = readAndPrune(resolveAppPaths({ rootDir }).userRegistryFile);
   const namedOnline = registry.filter((e) => Boolean(e.botName)).length;
@@ -660,6 +677,13 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   });
   recordLifecycle(controls, msg, scope, 'received', preview);
 
+  const selfOpenId = channel.botIdentity?.openId;
+  if (selfOpenId && msg.senderId === selfOpenId) {
+    recordLifecycle(controls, msg, scope, 'dropped', preview, 'self-echo');
+    log.info('intake', 'skip-self-echo', { scope, sender: msg.senderId.slice(-6) });
+    return;
+  }
+
   const accessDecision =
     msg.chatType === 'p2p'
       ? canUseDm(controls.profileConfig, controls, msg.senderId)
@@ -814,6 +838,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   if (!firstMsg || !lastMsg) return;
 
   const chatId = firstMsg.chatId;
+  const selfOpenId = channel.botIdentity?.openId;
   const threadId = firstMsg.threadId;
 
   const resourceItems = batch.flatMap((m) =>
@@ -930,21 +955,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
   } else {
-    log.info('session', 'fresh', { cwd, ...(flow.cursorIdleReset ? { cursorIdleReset: true } : {}) });
-  }
-  if (flow.cursorIdleReset) {
-    try {
-      await channel.send(
-        chatId,
-        {
-          markdown:
-            '💡 距上次对话已较久，已自动开启新的 Agent 上下文（飞书聊天记录保留，Cursor 侧不继承此前会话）。',
-        },
-        sendOpts,
-      );
-    } catch (err) {
-      log.warn('session', 'idle-reset-notice-failed', { err: String(err) });
-    }
+    log.info('session', 'fresh', { cwd });
   }
   const recordSession = (evt: AgentEvent): void => {
     recordRunSessionEvent({
@@ -1097,6 +1108,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
       const cardFinalState = await renderDone;
       await tryExecuteHandoffs(channel, chatId, fleetConfig, cardFinalState, sendOpts);
+      await tryDispatchReplyMentionsFromState(
+        channel,
+        chatId,
+        fleetConfig,
+        cardFinalState,
+        selfOpenId,
+        sendOpts,
+      );
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let producerStarted = false;
@@ -1163,6 +1182,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         log.info('supplementary-image', 'batch-sent', { count: imageCount });
       }
       await tryExecuteHandoffs(channel, chatId, fleetConfig, finalState, sendOpts);
+      await tryDispatchReplyMentionsFromState(
+        channel,
+        chatId,
+        fleetConfig,
+        finalState,
+        selfOpenId,
+        sendOpts,
+      );
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -1177,7 +1204,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       );
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
-        await channel.send(chatId, { markdown: body }, sendOpts);
+        await sendAgentMarkdown(channel, chatId, body, fleetConfig, selfOpenId, sendOpts);
       }
       await tryExecuteHandoffs(channel, chatId, fleetConfig, finalState, sendOpts);
     }
@@ -1492,8 +1519,8 @@ function buildPrompt(
   const fleetInstructions =
     fleetPeers.length > 0
       ? [
-          `Fleet 协作 bot（open_id 用于结构化 @，勿纯文本 @）：${fleetPeers.map((p) => `${p.name}=${p.openId ?? '?'}`).join(', ')}`,
-          '委派给其他 bot 时用 /delegate @名字 任务描述，或输出 {"__bridge_handoff":true,"targetBot":"名字","payload":"..."}。',
+          `Fleet 协作 bot：${fleetPeers.map((p) => `${p.displayName ?? p.name}=${p.openId ?? '?'}`).join(', ')}`,
+          '需要其他 bot 接手时，在正文自然写 @名字 任务（如 @基石 请验收），bridge 会自动代发结构化 @。',
         ]
       : [];
 

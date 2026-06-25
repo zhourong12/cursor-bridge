@@ -33,12 +33,14 @@ export async function loadAlwaysApplyCursorRules(cwd: string): Promise<string | 
 }
 
 function parseAlwaysApplyRule(filename: string, content: string): CursorRule | undefined {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n?/);
+  // Normalize CRLF → LF so the frontmatter regex works on Windows-authored files.
+  const normalized = content.replace(/\r\n/g, '\n');
+  const match = normalized.match(/^---\n([\s\S]*?)\n---\n?/);
   if (!match) return undefined;
   const frontmatter = match[1] ?? '';
   if (!/^alwaysApply:\s*true\s*$/m.test(frontmatter)) return undefined;
 
-  const body = content.slice(match[0].length).trim();
+  const body = normalized.slice(match[0].length).trim();
   if (!body) return undefined;
   return { filename, body };
 }

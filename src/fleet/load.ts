@@ -31,6 +31,38 @@ export async function saveFleetConfig(rootDir: string | undefined, fleet: FleetC
   await writeFileAtomic(path, `${JSON.stringify({ ...fleet, schemaVersion: 1 }, null, 2)}\n`, { mode: 0o600 });
 }
 
+/**
+ * Upsert this bridge's own bot into fleet.bots keyed by profile name, recording
+ * the open_id the SDK handshake returned. open_id is stable per bot per tenant
+ * (same across all chats), so recording it once makes /delegate work in any
+ * chat without querying chat members (which doesn't list bots anyway).
+ *
+ * Preserves any human-set fields (role, description, defaultCwd) and only
+ * fills/refreshes openId + name. Returns true if the file changed.
+ */
+export async function upsertSelfBot(
+  rootDir: string | undefined,
+  input: { profile: string; openId: string; name?: string },
+): Promise<boolean> {
+  const fleet = await loadFleetConfig(rootDir);
+  const bots = fleet.bots ?? {};
+  const existing = bots[input.profile];
+  const next = {
+    profile: input.profile,
+    ...(existing?.role ? { role: existing.role } : {}),
+    ...(existing?.description ? { description: existing.description } : {}),
+    ...(existing?.defaultCwd ? { defaultCwd: existing.defaultCwd } : {}),
+    openId: input.openId,
+    ...(input.name ? { name: input.name } : {}),
+  };
+  if (existing?.openId === input.openId && existing?.name === next.name && existing?.profile === input.profile) {
+    return false;
+  }
+  bots[input.profile] = next;
+  await saveFleetConfig(rootDir, { ...fleet, bots });
+  return true;
+}
+
 /** Peers excluding the current profile's bot (by profile name match). */
 export function fleetPeersForProfile(fleet: FleetConfig, currentProfile: string): FleetPeer[] {
   const bots = fleet.bots ?? {};
@@ -40,6 +72,7 @@ export function fleetPeersForProfile(fleet: FleetConfig, currentProfile: string)
     out.push({
       name,
       profile: entry.profile,
+      ...(entry.name ? { displayName: entry.name } : {}),
       ...(entry.openId ? { openId: entry.openId } : {}),
       ...(entry.role ? { role: entry.role } : {}),
     });
@@ -58,6 +91,9 @@ export function resolveFleetBot(
   const lower = trimmed.toLowerCase();
   for (const [name, entry] of Object.entries(bots)) {
     if (name.toLowerCase() === lower) return { name, entry };
+    // Match by bot display name (entry.name, e.g. "基石") — agents address
+    // bots by display name in /delegate and handoff, not by profile key.
+    if (entry.name && entry.name.toLowerCase() === lower) return { name, entry };
     if (entry.openId === trimmed) return { name, entry };
   }
   if (trimmed.startsWith('ou_')) {

@@ -1,0 +1,59 @@
+---
+description: Fleet 多 bot 协作的身份与 open_id 规则，排查 230002 / @不到 / delegate 失败
+globs:
+alwaysApply: false
+---
+
+# Fleet 多 bot 协作：身份与 open_id 规则
+
+当用户遇到「@ 其他 bot 一直失败」「delegate 不行」「openid 老是弄错」「230002 Bot/User can NOT be out of the chat」时，先按本规则排查。
+
+## 三个 open_id，必须分清
+
+| 名称 | 来源 | 含义 |
+|------|------|------|
+| **bridge 绑定 open_id** | `~/.lark-channel/registry/processes.json` 的 `botOpenId` | bridge 进程登录飞书后，自己这个 bot 实例的 open_id |
+| **群里实际 open_id** | 飞书群成员列表里那个 bot 的 open_id（`lark-cli` / 群成员接口可查） | 群里真正存在、能被 @ 的那个 bot 实例 |
+| **fleet.json bots.openId** | `~/.lark-channel/fleet.json` 手填 | 用于 `/delegate` 和 handoff 查找目标的 open_id |
+
+**铁律：三者必须指向同一个 bot 实例。** 任一不一致 → `230002` 或 @ 不到。
+
+## 典型故障：同一个 appId 出现两个 open_id
+
+现象：bridge 侧 `botOpenId = ou_AAAA`，群里的同名 bot = `ou_BBBB`。
+原因：同一 appId 在飞书后台重建/重置过 bot 实例，或群里加的是旧实例、bridge 绑的是新实例。
+结果：bridge 用 `ou_AAAA` 发消息，但群里只有 `ou_BBBB` → `230002 Bot/User can NOT be out of the chat`。
+
+修法（二选一）：
+1. 把 bridge 绑的那个 bot 实例（`ou_AAAA`）加进群；
+2. 或重新绑定 bridge 到群里已有的实例（`ou_BBBB`）——重置该 profile 的飞书凭据/重新登录。
+
+## fleet.json bots 段规则
+
+- 每个要参与协作的 profile 都必须在 `bots` 段有条目。
+- `bots.<name>.openId` **必须填「群里实际 open_id」**，不是 registry 里的 `botOpenId`（除非两者已确认一致）。
+- `bots.<name>.profile` 指向本机 profile 名。
+- 缺条目 → 该 bot 对其他 bot 隐身，`/delegate @名字` 报「未在 fleet.json 找到 open_id」。
+
+示例：
+```json
+"bots": {
+  "cejiang":      { "profile": "cejiang",      "openId": "ou_xxx", "role": "tester" },
+  "cursor":       { "profile": "cursor",       "openId": "ou_yyy", "role": "dev" },
+  "cursor-jishi": { "profile": "cursor-jishi", "openId": "ou_zzz", "role": "dispatcher" }
+}
+```
+
+## 排查 SOP
+
+1. 查 bridge 侧身份：`registry/processes.json` 的 `botOpenId`。
+2. 查群里实际 bot：在飞书群里看成员，或用 `lark-cli` 查群成员列表里该 bot 的 open_id。
+3. 两者不同 → 先解决身份错配（加群 or 重绑），再谈协作。
+4. 相同 → 检查 `fleet.json` 的 `bots` 段是否配全、`openId` 是否等于上面一致的值。
+5. `fleet restart` 让 `fleetPeers` 重新注入 prompt（改 `fleet.json` 后必须重启生效）。
+
+## 注意
+
+- bot **只有被真实结构化 @ 才能收到群消息**；纯文本「@名字」无效（飞书机制，非本仓库限制）。
+- `autoStart` 只影响 `fleet start`（不带 `--all`）启动哪些 profile；`fleet-restart.bat` 已改为 `--all`，发现的所有 profile 都启动。`bots` 段才是协作识别用的。
+- 改 `fleet.json` 后需重启 Bot 进程，`fleetPeers` 在 `startChannel` 时读取一次。

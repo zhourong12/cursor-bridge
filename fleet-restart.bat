@@ -10,9 +10,9 @@ if errorlevel 1 (
 )
 
 echo.
-echo [Lark Bridge Fleet] npm run lark-bridge:fleet-restart
+echo [Lark Bridge Fleet] npm run lark-bridge:fleet-restart:all
 echo.
-call npm run lark-bridge:fleet-restart
+call npm run lark-bridge:fleet-restart:all
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
   echo.

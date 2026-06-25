@@ -1,4 +1,3 @@
-import { CURSOR_RESUME_IDLE_MS } from '../agent/cursor/timeouts';
 import type { AgentCapability } from '../agent/capability';
 import type { AgentEvent } from '../agent/types';
 import { log } from '../core/logger';
@@ -56,8 +55,6 @@ export type StartRunFlowResult =
       policy: RunPolicyAllow;
       cwdRealpath: string;
       resumeFrom?: string;
-      /** Cursor catalog idle exceeded — new agent context, not resume. */
-      cursorIdleReset?: boolean;
     }
   | {
       ok: false;
@@ -116,7 +113,6 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   let resumeFrom: string | undefined;
   let sessionId: string | undefined;
   let threadId: string | undefined;
-  let cursorIdleReset = false;
   if (input.sessionCatalog) {
     const catalogEntry = input.sessionCatalog.activeFor({
       scopeId: input.scopeId,
@@ -131,25 +127,8 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       threadId = catalogEntry.threadId;
       resumeFrom = threadId;
     } else if (catalogEntry?.agentId === 'cursor') {
-      const idleMs = input.now - catalogEntry.updatedAt;
-      if (idleMs <= CURSOR_RESUME_IDLE_MS) {
-        sessionId = catalogEntry.cursorAgentId;
-        resumeFrom = sessionId;
-      } else {
-        log.info('cursor', 'session-idle-skip', {
-          cursorAgentId: catalogEntry.cursorAgentId,
-          idleMs,
-          idleLimitMs: CURSOR_RESUME_IDLE_MS,
-        });
-        input.sessionCatalog.archiveActive({
-          scopeId: input.scopeId,
-          agentId: 'cursor',
-          cwdRealpath: workspace.cwdRealpath,
-          policyFingerprint: policy.policyFingerprint,
-          now: input.now,
-        });
-        cursorIdleReset = true;
-      }
+      sessionId = catalogEntry.cursorAgentId;
+      resumeFrom = sessionId;
     }
   }
   if (!resumeFrom && input.capability.agentId === 'claude') {
@@ -203,7 +182,6 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     policy,
     cwdRealpath: workspace.cwdRealpath,
     ...(resumeFrom ? { resumeFrom } : {}),
-    ...(cursorIdleReset ? { cursorIdleReset: true } : {}),
   };
 }
 

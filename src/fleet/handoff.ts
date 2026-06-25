@@ -57,7 +57,7 @@ export function resolveHandoffTarget(
   if (handoff.targetBot) {
     const resolved = resolveFleetBot(fleet, handoff.targetBot);
     if (resolved?.entry.openId) {
-      return { openId: resolved.entry.openId, name: resolved.name };
+      return { openId: resolved.entry.openId, name: resolved.entry.name ?? resolved.name };
     }
   }
   return undefined;

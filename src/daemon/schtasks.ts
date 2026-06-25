@@ -75,13 +75,14 @@ async function writeLauncherCmd(profile: string): Promise<void> {
   if (!bridgeEntryPath) {
     throw new Error('cannot determine bridge entry path (process.argv[1] is empty)');
   }
+  const extraEnv = collectDaemonExtraEnv();
   const content = buildLauncherCmd({
     nodePath: process.execPath,
     bridgeEntryPath,
     envPath: process.env.PATH ?? '',
     profile,
     channelHome: paths.rootDir,
-    extraEnv: collectDaemonExtraEnv(),
+    extraEnv,
   });
   const cmdPath = windowsLauncherCmdPath(profile);
   const vbsPath = windowsLauncherVbsPath(profile);
@@ -89,9 +90,9 @@ async function writeLauncherCmd(profile: string): Promise<void> {
   await mkdir(daemonLogDir(profile), { recursive: true });
   await writeFile(cmdPath, content, 'utf8');
   await writeFile(vbsPath, buildLauncherVbs(cmdPath), 'utf8');
-  const fp = secretFingerprint(inputs.extraEnv?.CURSOR_API_KEY ?? process.env.CURSOR_API_KEY);
+  const fp = secretFingerprint(extraEnv?.CURSOR_API_KEY ?? process.env.CURSOR_API_KEY);
   log.info('daemon', 'launcher-written', {
-    profile: inputs.profile,
+    profile,
     cmdPath,
     cursorApiKey: fp,
   });
