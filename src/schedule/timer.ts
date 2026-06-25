@@ -12,6 +12,7 @@ export interface ScheduleTimerDeps {
   channel: LarkChannel;
   agent: AgentAdapter;
   profileDir: string;
+  profileName: string;
   profileConfig: ProfileConfig;
 }
 
@@ -37,6 +38,7 @@ export function startScheduleTimer(deps: ScheduleTimerDeps): { stop(): void } {
             channel: deps.channel,
             agent: deps.agent,
             profileDir: deps.profileDir,
+            profileName: deps.profileName,
             defaultCwd,
             model,
           },

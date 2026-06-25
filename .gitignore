@@ -2,3 +2,9 @@ node_modules/
 dist/
 .env
 vendor/
+release/
+.idea/
+
+# 本地测试截图（非仓库资源）
+/auth_*.png
+/oauth-qrcode.png

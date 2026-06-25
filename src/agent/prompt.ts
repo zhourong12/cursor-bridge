@@ -17,6 +17,8 @@ export interface BridgePromptContext {
   botOpenId?: string;
   /** Accounts @-mentioned in the triggering message(s), deduped across the batch. */
   mentions?: BridgePromptMention[];
+  /** Other bots in the fleet (from fleet.json), excluding self. */
+  peers?: Array<{ name: string; openId?: string; role?: string; profile: string }>;
   threadId?: string;
   messageIds?: string[];
   source: BridgePromptSource;

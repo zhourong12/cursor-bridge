@@ -1,0 +1,73 @@
+profile_version: "3.3"
+project: cursor-bridge-console
+stack: "Electron + Node admin API + SPA"
+
+commands:
+  build: "npm run build"
+  pack: "npm run pack:console"
+  serve: "lark-channel-bridge admin serve --port 3928"
+  exe_unpacked: "release/win-unpacked/Bridge Console.exe"
+  exe_portable: "release/BridgeConsole-0.1.0-portable.exe"
+
+ports:
+  admin: 3928
+
+preflight:
+  - "release/BridgeConsole-0.1.0-portable.exe 存在且 >50MB"
+  - "release/win-unpacked/Bridge Console.exe 存在"
+  - "resources/bridge/dist/cli.js 与 admin/static 已打入 extraResources"
+  - "~/.lark-channel/admin-token 可读（或 LARK_BRIDGE_ADMIN_TOKEN）"
+
+auth:
+  type: bearer_token
+  token_file: "~/.lark-channel/admin-token"
+  success_indicators:
+    - "Bridge Console"
+    - "概览"
+    - "Profiles"
+    - "Bot 绑定"
+
+verification:
+  browser: agent-browser
+  browser_notes: "本地 127.0.0.1，无验证码；URL 带 ?token= 自动登录"
+
+smoke_flows:
+  - id: EXE-01
+    name: "便携 exe 产物存在"
+    expect: "release/BridgeConsole-0.1.0-portable.exe 可访问"
+  - id: EXE-02
+    name: "解包 exe 启动并监听 3928"
+    expect: "127.0.0.1:3928 在 15s 内 LISTENING"
+  - id: EXE-03
+    name: "Electron 仅 1 个可见主窗口"
+    expect: "Get-Process 'Bridge Console' 中带 MainWindowTitle 的进程数 <= 1"
+  - id: API-01
+    name: "GET /api/health"
+    expect: '{"ok":true}'
+  - id: API-02
+    name: "GET /api/overview（Bearer）"
+    expect: "JSON 含 runningCount、profileCount、home"
+  - id: API-03
+    name: "GET / 静态页"
+    expect: "HTTP 200，body 含 Bridge Console"
+  - id: UI-01
+    name: "浏览器加载管理页（带 token）"
+    expect: "快照含侧边栏：概览、Profiles、Fleet、Bot 绑定"
+  - id: UI-BOTS-01
+    name: "GET /api/bots（Bearer）"
+    expect: "JSON 数组，每项含 name、connected、secretStored、larkCliBound"
+  - id: UI-BOTS-02
+    name: "Bot 绑定页 #bots 可切换"
+    expect: "含扫码区、凭证表单、Bot 列表表头"
+  - id: API-BOTS-01
+    name: "POST /api/bots/register/start"
+    expect: "JSON 含 id、status（pending 或 ready）"
+  - id: API-BOTS-CRED-01
+    name: "POST /api/bots 凭证绑定校验"
+    expect: "非法 appId/secret 返回 400 含「凭证」"
+  - id: UI-BOTS-CRED-01
+    name: "已有 Bot 参考卡片"
+    expect: "GET /api/bots 含 cursor、appId、workspace、botName"
+
+rules:
+  - ".cursor/rules/scheduler.mdc"

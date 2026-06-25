@@ -100,7 +100,7 @@ function reasoningPanel(content: string, active: boolean): object {
   const title = active ? '🧠 **思考中**' : '🧠 **思考完成，点击查看**';
   return collapsiblePanel({
     title,
-    expanded: active,
+    expanded: false,
     border: 'grey',
     body: truncate(content, REASONING_MAX),
   });

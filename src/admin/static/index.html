@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bridge Console</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app" class="desktop">
+    <header class="titlebar">
+      <div class="titlebar-drag">
+        <span class="brand-mark" aria-hidden="true">⬡</span>
+        <div>
+          <div class="title">Bridge Console</div>
+          <div class="subtitle">Lark Channel Bridge</div>
+        </div>
+      </div>
+      <div class="titlebar-actions">
+        <button id="btn-refresh" class="btn ghost" title="刷新" type="button">↻</button>
+        <span id="conn-dot" class="dot offline" title="连接状态"></span>
+      </div>
+    </header>
+
+    <div class="shell">
+      <nav class="sidebar" aria-label="主导航">
+        <div class="nav-label">控制台</div>
+        <a href="#overview" class="nav-item active" data-page="overview"><span class="nav-icon">◈</span>概览</a>
+        <a href="#bots" class="nav-item" data-page="bots"><span class="nav-icon">◉</span>Bot 绑定</a>
+        <a href="#profiles" class="nav-item" data-page="profiles"><span class="nav-icon">▣</span>Profiles</a>
+        <a href="#fleet" class="nav-item" data-page="fleet"><span class="nav-icon">⬡</span>Fleet</a>
+        <div class="nav-label">运维</div>
+        <a href="#processes" class="nav-item" data-page="processes"><span class="nav-icon">▸</span>进程</a>
+        <a href="#schedules" class="nav-item" data-page="schedules"><span class="nav-icon">◷</span>定时任务</a>
+        <a href="#logs" class="nav-item" data-page="logs"><span class="nav-icon">▤</span>日志</a>
+        <div class="sidebar-foot">
+          <div class="foot-label">数据目录</div>
+          <small id="home-path">~/.lark-channel</small>
+        </div>
+      </nav>
+
+      <main class="content">
+        <section id="page-overview" class="page active">
+          <header class="page-header">
+            <div class="page-eyebrow">Signal · Overview</div>
+            <h1>概览</h1>
+            <p class="page-desc">管理界面只占一个 HTTP 端口；每个 Bot 是独立的 Bridge 进程（无单独 Web 端口）。</p>
+          </header>
+          <div class="cards" id="overview-cards"></div>
+          <div class="panel panel-accent" id="overview-console"></div>
+          <div class="panel">
+            <div class="panel-head">
+              <h2 class="panel-title">Bot 进程（注册表）</h2>
+              <span class="hint" id="overview-process-hint"></span>
+            </div>
+            <div class="table-wrap" id="overview-processes"></div>
+          </div>
+          <div class="panel">
+            <h2 class="panel-title">全部 Profile 状态</h2>
+            <div class="table-wrap" id="overview-fleet"></div>
+          </div>
+          <div class="panel" id="overview-warnings"></div>
+        </section>
+
+        <section id="page-bots" class="page">
+          <header class="page-header">
+            <div class="page-eyebrow">Channel · Bots</div>
+            <h1>Bot 绑定</h1>
+            <p class="page-desc">注册飞书应用、创建 Profile，并自动登记 Fleet、设为当前、启动 Bot。</p>
+          </header>
+
+          <div class="panel panel-accent" id="bots-reference-panel">
+            <h2 class="panel-title">已有 Bot 节点</h2>
+            <p class="hint">对照运行中的 Profile 配置；可一键套用到下方表单。工作区不存在时将自动创建。</p>
+            <div id="bots-reference"></div>
+          </div>
+
+          <div class="bind-grid">
+            <div class="panel">
+              <h2 class="panel-title">扫码新建</h2>
+              <p class="hint">飞书 App 扫码创建应用，完成后填写 Profile 并保存。</p>
+              <div id="qr-area" class="qr-area hidden">
+                <img id="qr-img" alt="QR" width="200" height="200" />
+                <p><a id="qr-link" href="#" target="_blank" rel="noopener">在浏览器打开</a></p>
+                <p id="qr-status" class="hint"></p>
+              </div>
+              <form id="qr-complete-form" class="form-grid hidden">
+                <label>Profile 名称<input name="name" required placeholder="cursor" /></label>
+                <label>Agent
+                  <select name="agent">
+                    <option value="cursor">cursor</option>
+                    <option value="claude">claude</option>
+                    <option value="codex">codex</option>
+                  </select>
+                </label>
+                <label class="workspace-label">工作区<input name="workspace" class="path-input" placeholder="按 Profile 自动生成" /></label>
+                <button type="submit" class="btn primary">完成绑定</button>
+              </form>
+              <button type="button" class="btn primary" id="btn-qr-start">获取二维码</button>
+            </div>
+
+            <div class="panel">
+              <h2 class="panel-title">凭证绑定</h2>
+              <p class="hint">已有 AppId / Secret 时直接创建；将写入 <code>fleet.json</code> 并启动。</p>
+              <form id="bot-cred-form" class="form-grid">
+                <label>Profile 名称<input name="name" required placeholder="mybot" /></label>
+                <label>Agent
+                  <select name="agent">
+                    <option value="cursor">cursor</option>
+                    <option value="claude">claude</option>
+                    <option value="codex">codex</option>
+                  </select>
+                </label>
+                <label>App ID<input name="appId" required placeholder="cli_xxx" class="mono" /></label>
+                <label>App Secret<input name="appSecret" type="password" required /></label>
+                <label>Tenant
+                  <select name="tenant">
+                    <option value="feishu">feishu</option>
+                    <option value="lark">lark</option>
+                  </select>
+                </label>
+                <label class="workspace-label">工作区<input name="workspace" class="path-input" placeholder="按 Profile 自动生成" /></label>
+                <button type="submit" class="btn primary">创建并绑定</button>
+              </form>
+            </div>
+          </div>
+
+          <div class="table-wrap" id="bots-table"></div>
+        </section>
+
+        <section id="page-profiles" class="page">
+          <header class="page-header">
+            <div class="page-eyebrow">Profiles</div>
+            <h1>Profiles</h1>
+            <p class="page-desc">本地 Profile 列表、Daemon 状态与连接情况。</p>
+          </header>
+          <div class="table-wrap" id="profiles-table"></div>
+        </section>
+
+        <section id="page-fleet" class="page">
+          <header class="page-header">
+            <div class="page-eyebrow">Fleet · Coordination</div>
+            <h1>Fleet 协同</h1>
+            <p class="page-desc">多 Bot 编排、批量启停与 openId 同步。</p>
+          </header>
+          <div class="toolbar">
+            <button class="btn primary" id="fleet-restart" type="button">重启 Fleet</button>
+            <button class="btn" id="fleet-start-autostart" type="button">启动 autoStart</button>
+            <button class="btn" id="fleet-start-all" type="button">启动全部 Profile</button>
+            <button class="btn" id="fleet-stop-all" type="button">停止全部</button>
+            <button class="btn" id="fleet-sync-openids" type="button">同步 openId</button>
+          </div>
+          <p class="hint" id="fleet-hint">Bot 以独立 node 进程运行（非 Console 内嵌）。重启会先停旧进程并清锁，等同 <code>fleet-restart.bat</code>。连接日志见 <a href="#logs">日志</a> 页（<code>logs/daemon/</code>）。</p>
+          <div class="table-wrap" id="fleet-status-table"></div>
+          <div class="panel">
+            <div class="panel-head">
+              <h2 class="panel-title">fleet.json</h2>
+              <button class="btn primary" id="fleet-save" type="button">保存</button>
+            </div>
+            <textarea id="fleet-editor" spellcheck="false"></textarea>
+          </div>
+        </section>
+
+        <section id="page-processes" class="page">
+          <header class="page-header">
+            <div class="page-eyebrow">Runtime</div>
+            <h1>运行进程</h1>
+            <p class="page-desc">当前 Bridge 进程注册表，可终止异常实例。</p>
+          </header>
+          <div class="table-wrap" id="processes-table"></div>
+        </section>
+
+        <section id="page-schedules" class="page">
+          <header class="page-header">
+            <div class="page-eyebrow">Cron</div>
+            <h1>定时任务</h1>
+            <p class="page-desc">按 Profile 登记的周期任务，结果发回登记会话。</p>
+          </header>
+          <div class="panel">
+            <h2 class="panel-title">新增任务</h2>
+            <p class="hint">Cron 五段：<code>分 时 日 月 周</code>，例如每天 9:00 → <code>0 9 * * *</code>。结果发回登记的 Chat。</p>
+            <form id="schedule-form" class="schedule-form">
+              <div class="schedule-form-meta">
+                <label>Profile
+                  <select name="profile" id="schedule-profile" required></select>
+                </label>
+                <label>Cron
+                  <input name="cron" required placeholder="0 9 * * *" class="mono" />
+                </label>
+                <label>Chat ID
+                  <input name="chatId" required placeholder="oc_xxx" class="mono" />
+                </label>
+              </div>
+              <label class="schedule-form-prompt">Prompt
+                <textarea name="prompt" required rows="5" placeholder="定时执行的任务描述…"></textarea>
+              </label>
+              <div class="schedule-form-footer">
+                <label class="checkbox"><input type="checkbox" name="silent" /> 静默（不发飞书）</label>
+                <button type="submit" class="btn primary">添加任务</button>
+              </div>
+            </form>
+          </div>
+          <div id="schedules-list"></div>
+        </section>
+
+        <section id="page-logs" class="page">
+          <header class="page-header">
+            <div class="page-eyebrow">Logs</div>
+            <h1>日志</h1>
+            <p class="page-desc">按 Profile 查看本地日志文件尾部。</p>
+          </header>
+          <div class="toolbar">
+            <select id="log-profile"></select>
+            <select id="log-file"></select>
+            <button class="btn" id="log-refresh" type="button">刷新</button>
+          </div>
+          <pre id="log-content" class="log-view"></pre>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="auth-gate" class="auth-gate hidden">
+    <div class="auth-card">
+      <div class="brand-mark" style="margin:0 auto 16px" aria-hidden="true">⬡</div>
+      <h2>Bridge Console</h2>
+      <p>输入 Admin Token 以连接本地管理 API<br><code>~/.lark-channel/admin-token</code></p>
+      <input id="token-input" type="password" placeholder="Bearer token" autocomplete="off" />
+      <button id="token-submit" class="btn primary" type="button">连接</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

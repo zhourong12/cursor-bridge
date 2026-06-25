@@ -12,6 +12,16 @@ import type {
 } from '@cursor/sdk';
 
 import { log } from '../../core/logger';
+import { classifyCursorError, secretFingerprint } from '../../core/diagnostics';
+import { TimeoutError, withTimeout } from '../../core/with-timeout';
+import { touchSelfHealStats } from '../../runtime/bot-runtime-stats';
+import {
+  AGENT_ACQUIRE_TIMEOUT_MS,
+  isTimeoutError,
+  MODEL_LIST_TIMEOUT_MS,
+  RUN_WAIT_TIMEOUT_MS,
+  SEND_TIMEOUT_MS,
+} from './timeouts';
 import { prefixBridgeSystemPrompt } from '../bridge-system-prompt';
 import { AgentPreflightError, type AgentAvailability } from '../preflight';
 import type {
@@ -24,6 +34,7 @@ import type {
 import { loadAlwaysApplyCursorRules } from './rules';
 import {
   isActiveRunConflict,
+  cancelRunningRunsForAgent,
   releaseAgentRunLockIfTerminal,
   sendWithActiveRunRetry,
 } from './stale-run-cleanup';
@@ -159,10 +170,19 @@ export class CursorAdapter implements AgentAdapter {
     );
     let agent: SDKAgent | undefined;
     let cwd: string | undefined;
+    let keepAgentAlive = false;
+    let runOutcome: 'ok' | 'retry' | 'fatal' | 'aborted' = 'fatal';
     try {
       const target = await this.resolveAgentTarget(apiKey, model, opts);
       agent = target.agent;
       cwd = target.cwd;
+      log.info('cursor', 'run-begin', {
+        mode: target.resumed ? 'resume' : 'create',
+        sessionId: opts.sessionId,
+        agentId: agent.agentId,
+        resumeFrom: target.resumed ? opts.sessionId : undefined,
+        apiKey: secretFingerprint(apiKey),
+      });
 
       yield {
         type: 'system',
@@ -173,45 +193,67 @@ export class CursorAdapter implements AgentAdapter {
 
       const projectRules = await this.loadRules(opts.cwd);
       const prompt = prefixBridgeSystemPrompt(opts.prompt, this.botIdentity, projectRules);
-      const isResume = Boolean(opts.sessionId);
 
       const runResult = yield* this.attemptRun(agent, target.cwd, prompt, runState);
 
-      if (runResult === 'ok') return;
-
-      if (runResult === 'retryable' && !isResume) {
-        log.warn('cursor', 'run-retry-same-agent', { agentId: agent.agentId });
-        await releaseAgentRunLockIfTerminal(agent.agentId, target.cwd);
-        await delay(RETRY_BACKOFF_MS);
-        const retryResult = yield* this.attemptRun(agent, target.cwd, prompt, runState);
-        if (retryResult !== 'ok') {
-          yield terminalError('运行失败，请发 /new 开新会话后重试。');
-        }
+      if (runResult === 'ok') {
+        keepAgentAlive = true;
+        runOutcome = 'ok';
         return;
       }
 
-      if (runResult === 'retryable' && isResume) {
-        log.warn('cursor', 'run-fallback-fresh', { stalledAgent: agent.agentId, cwd: target.cwd });
+      if (runResult === 'retryable') {
+        log.warn('cursor', 'self-heal', {
+          action: 'discard-and-recreate',
+          stalledAgent: agent.agentId,
+          resumed: target.resumed,
+          cwd: target.cwd,
+        });
+        touchSelfHealStats();
         await releaseAgentRunLockIfTerminal(agent.agentId, target.cwd);
         await disposeAgent(agent);
         await delay(RETRY_BACKOFF_MS);
 
-        const freshAgent = await this.createAgent({ apiKey, model, local: { cwd: target.cwd } });
+        const freshAgent = await withTimeout(
+          this.createAgent({ apiKey, model, local: { cwd: target.cwd } }),
+          AGENT_ACQUIRE_TIMEOUT_MS,
+          'createAgent',
+        );
         agent = freshAgent;
         yield { type: 'system', sessionId: freshAgent.agentId, cwd: target.cwd, model: model.id };
 
         const freshResult = yield* this.attemptRun(freshAgent, target.cwd, prompt, runState);
         if (freshResult !== 'ok') {
           yield terminalError('新会话也运行失败，请检查 Cursor IDE 是否正常。');
+          runOutcome = 'retry';
+          return;
         }
+        keepAgentAlive = true;
+        runOutcome = 'ok';
         return;
       }
+      runOutcome = 'retry';
     } catch (err) {
-      yield terminalError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn('cursor', 'run-exception', {
+        agentId: agent?.agentId,
+        errorKind: classifyCursorError(message),
+        message: message.slice(0, 240),
+      });
+      yield terminalError(message);
     } finally {
       if (agent && cwd) {
         await releaseAgentRunLockIfTerminal(agent.agentId, cwd);
-        await disposeAgent(agent);
+        const dispose = !keepAgentAlive || runState.shouldStop();
+        log.info('cursor', 'run-finish', {
+          agentId: agent.agentId,
+          outcome: runState.shouldStop() ? 'aborted' : runOutcome,
+          keepAgentAlive: keepAgentAlive && !runState.shouldStop(),
+          disposeAgent: dispose,
+        });
+        if (dispose) {
+          await disposeAgent(agent);
+        }
       }
     }
   }
@@ -239,13 +281,28 @@ export class CursorAdapter implements AgentAdapter {
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      if (!sawOutput && isRetryableRunError(errMsg)) return 'retryable';
+      if (!sawOutput && isRetryableRunError(errMsg, err)) return 'retryable';
       yield terminalError(formatRunFailureMessage(run?.id ?? 'unknown', undefined, errMsg));
       return 'fatal';
     }
 
     if (!run) return 'ok';
-    const result = await run.wait();
+    let result: RunResult;
+    try {
+      result = await withTimeout(run.wait(), RUN_WAIT_TIMEOUT_MS, 'run.wait');
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        if (run.supports('cancel')) {
+          await run.cancel().catch(() => {});
+        } else {
+          await cancelRunningRunsForAgent(agent.agentId, cwd, 'wait-timeout-cancelled');
+        }
+      }
+      if (!sawOutput && isRetryableRunError(undefined, err)) return 'retryable';
+      const errMsg = err instanceof Error ? err.message : String(err);
+      yield terminalError(formatRunFailureMessage(run.id, undefined, errMsg));
+      return 'fatal';
+    }
     if (result.status !== 'error') {
       yield terminalEvent(agent.agentId, result);
       return 'ok';
@@ -254,6 +311,13 @@ export class CursorAdapter implements AgentAdapter {
     const errorDetail = !result.result?.trim()
       ? await readRunErrorDetail(cwd, agent.agentId, run.id)
       : undefined;
+    const failText = result.result?.trim() || errorDetail || '';
+    log.warn('cursor', 'run-error', {
+      agentId: agent.agentId,
+      runId: run.id,
+      errorKind: classifyCursorError(failText),
+      sawOutput,
+    });
     if (!sawOutput && isRetryableRunError(result.result?.trim() || errorDetail)) {
       return 'retryable';
     }
@@ -270,13 +334,18 @@ export class CursorAdapter implements AgentAdapter {
     apiKey: string,
     model: ModelSelection,
     opts: AgentRunOptions,
-  ): Promise<{ agent: SDKAgent; cwd: string }> {
+  ): Promise<{ agent: SDKAgent; cwd: string; resumed: boolean }> {
     if (this.cursorRuntime() === 'machine') {
       const machine = this.resolveMachineTarget();
       const agentId = opts.sessionId ?? (await this.discoverMachineAgentId(apiKey, machine.ref));
       return {
-        agent: await this.resumeAgent(agentId, { apiKey, model }),
+        agent: await withTimeout(
+          this.resumeAgent(agentId, { apiKey, model }),
+          AGENT_ACQUIRE_TIMEOUT_MS,
+          'resumeAgent',
+        ),
         cwd: machine.ref,
+        resumed: Boolean(opts.sessionId),
       };
     }
 
@@ -285,11 +354,30 @@ export class CursorAdapter implements AgentAdapter {
       model,
       local: { cwd: opts.cwd },
     } satisfies AgentOptions;
+    const cwd = opts.cwd!;
+
+    if (opts.sessionId) {
+      try {
+        const agent = await withTimeout(
+          this.resumeAgent(opts.sessionId, agentOptions),
+          AGENT_ACQUIRE_TIMEOUT_MS,
+          'resumeAgent',
+        );
+        return { agent, cwd, resumed: true };
+      } catch (err) {
+        if (!shouldFallbackToFreshAgent(err)) throw err;
+        log.warn('cursor', 'resume-fallback-create', {
+          sessionId: opts.sessionId,
+          errorKind: classifyCursorError(err instanceof Error ? err.message : String(err)),
+        });
+        touchSelfHealStats();
+      }
+    }
+
     return {
-      agent: opts.sessionId
-        ? await this.resumeAgent(opts.sessionId, agentOptions)
-        : await this.createAgent(agentOptions),
-      cwd: opts.cwd!,
+      agent: await withTimeout(this.createAgent(agentOptions), AGENT_ACQUIRE_TIMEOUT_MS, 'createAgent'),
+      cwd,
+      resumed: false,
     };
   }
 
@@ -332,7 +420,11 @@ export class CursorAdapter implements AgentAdapter {
 async function resolveModelSelection(apiKey: string, model: ModelSelection): Promise<ModelSelection> {
   if (model.params?.length) return model;
   try {
-    const models = await Cursor.models.list({ apiKey });
+    const models = await withTimeout(
+      Cursor.models.list({ apiKey }),
+      MODEL_LIST_TIMEOUT_MS,
+      'Cursor.models.list',
+    );
     const item = models.find((entry) => entry.id === model.id);
     const variant = item?.variants?.find((v) => v.isDefault) ?? item?.variants?.[0];
     if (item && variant?.params?.length) {
@@ -409,8 +501,11 @@ async function* streamLiveRun(
 
   let run: Run;
   try {
-    run = await sendPromise;
+    run = await withTimeout(sendPromise, SEND_TIMEOUT_MS, 'agent.send');
   } catch (err) {
+    if (isTimeoutError(err)) {
+      await cancelRunningRunsForAgent(agent.agentId, cwd, 'send-timeout-cancelled');
+    }
     if (isActiveRunConflict(err)) {
       yield terminalError(
         '会话中存在未结束的 Cursor 运行，已尝试清理仍未成功。请发 /stop 后重试；仍失败可 /new 开新会话。',
@@ -498,10 +593,24 @@ function isOutputEvent(ev: AgentEvent): boolean {
  * stall. Only used when the attempt produced no output, so re-sending the same
  * prompt cannot duplicate visible work.
  */
-function isRetryableRunError(detail?: string): boolean {
+function shouldFallbackToFreshAgent(err: unknown): boolean {
+  if (isTimeoutError(err)) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  const kind = classifyCursorError(msg);
+  return kind === 'network' || kind === 'auth' || kind === 'timeout';
+}
+
+function isRetryableRunError(detail?: string, err?: unknown): boolean {
+  if (err instanceof TimeoutError || (err !== undefined && isTimeoutError(err))) return true;
   const text = detail?.trim();
-  if (!text) return true;
-  return /Connection stalled|NGHTTP2_ENHANCE_YOUR_CALM|ECANCELED/i.test(text);
+  if (text) {
+    if (/timed out/i.test(text)) return true;
+    const kind = classifyCursorError(text);
+    if (kind === 'auth') return false;
+    if (kind === 'network' || kind === 'timeout') return true;
+    return /Connection stalled|NGHTTP2_ENHANCE_YOUR_CALM|ECANCELED/i.test(text);
+  }
+  return true;
 }
 
 function terminalEvent(agentId: string, result: RunResult, errorDetail?: string): AgentEvent {
@@ -536,6 +645,9 @@ function formatRunFailureMessage(
   }
   if (/WritableIterable is closed/i.test(detail ?? '')) {
     return '运行因 OAuth 阻塞或长时间无输出被中断。请私聊发 `/lark-auth` 完成授权，再发 `/lark-auth done` 后重试原任务。';
+  }
+  if (/Authentication error/i.test(detail ?? '')) {
+    return 'Cursor 认证失败：API Key 无效或已过期。请在 Cursor 设置中重新登录/生成 Key，更新项目 `.env` 的 `CURSOR_API_KEY` 后重启 Fleet（Console → 重启 Fleet）。';
   }
   if (detail) return `${detail} (run id: ${runId})`;
   return `Cursor Agent 运行失败 (run id: ${runId})，请重试`;

@@ -104,6 +104,11 @@ export interface AppPreferences {
    */
   showToolCalls?: boolean;
   /**
+   * Whether to render agent reasoning/thinking blocks in the output.
+   * Default true. Turn off to hide the "思考过程" section.
+   */
+  showThinking?: boolean;
+  /**
    * Cap on concurrent claude runs across all chats / topics. Excess runs
    * queue FIFO. Default 10. Mostly relevant for topic groups where each
    * topic can spawn its own run; capping protects RAM / token spend.
@@ -199,6 +204,11 @@ export function getMessageReplyMode(cfg: AppConfig): MessageReplyMode {
 /** Resolve the show-tool-calls preference with default fallback. */
 export function getShowToolCalls(cfg: AppConfig): boolean {
   return cfg.preferences?.showToolCalls !== false;
+}
+
+/** Resolve the show-thinking preference with default fallback. */
+export function getShowThinking(cfg: AppConfig): boolean {
+  return cfg.preferences?.showThinking !== false;
 }
 
 /** Resolve the max-concurrent-runs preference with default + sanity clamp. */

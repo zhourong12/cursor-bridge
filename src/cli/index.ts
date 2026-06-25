@@ -204,6 +204,80 @@ program
     await runServiceUnregister({ profile: opts.profile });
   });
 
+const fleet = program.command('fleet').description('Manage multiple bridge profiles as a fleet');
+
+fleet
+  .command('start')
+  .description('Start all fleet profiles (autoStart from fleet.json, or --all)')
+  .option('--all', 'start every configured profile')
+  .option('--profiles <names>', 'comma-separated profile names')
+  .action(async (opts: { all?: boolean; profiles?: string }) => {
+    const { runFleetStart, parseFleetProfilesFlag } = await import('./commands/fleet');
+    await runFleetStart({ all: opts.all, profiles: parseFleetProfilesFlag(opts.profiles) });
+  });
+
+fleet
+  .command('stop')
+  .description('Stop fleet profiles')
+  .option('--all', 'stop every configured profile')
+  .option('--profiles <names>', 'comma-separated profile names')
+  .action(async (opts: { all?: boolean; profiles?: string }) => {
+    const { runFleetStop, parseFleetProfilesFlag } = await import('./commands/fleet');
+    await runFleetStop({ all: opts.all, profiles: parseFleetProfilesFlag(opts.profiles) });
+  });
+
+fleet
+  .command('restart')
+  .description('Restart fleet profiles')
+  .option('--all', 'restart every configured profile')
+  .option('--profiles <names>', 'comma-separated profile names')
+  .action(async (opts: { all?: boolean; profiles?: string }) => {
+    const { runFleetRestart, parseFleetProfilesFlag } = await import('./commands/fleet');
+    await runFleetRestart({ all: opts.all, profiles: parseFleetProfilesFlag(opts.profiles) });
+  });
+
+fleet
+  .command('status')
+  .description('Show fleet status for all profiles')
+  .option('--all', 'show all profiles (default)')
+  .option('--profiles <names>', 'comma-separated profile names')
+  .action(async (opts: { all?: boolean; profiles?: string }) => {
+    const { runFleetStatus, parseFleetProfilesFlag } = await import('./commands/fleet');
+    await runFleetStatus({ all: opts.all ?? true, profiles: parseFleetProfilesFlag(opts.profiles) });
+  });
+
+const admin = program
+  .command('admin')
+  .description('Bridge Console — local admin desktop UI');
+
+admin
+  .command('serve')
+  .description('Start Bridge Console HTTP server (127.0.0.1)')
+  .option('-p, --port <number>', 'listen port', '3928')
+  .option('--host <host>', 'bind host', '127.0.0.1')
+  .option('--open', 'open browser after start')
+  .action(async (opts: { port?: string; host?: string; open?: boolean }) => {
+    const { runAdminServe } = await import('./commands/admin');
+    await runAdminServe({
+      port: opts.port ? Number(opts.port) : 3928,
+      host: opts.host,
+      open: opts.open,
+    });
+  });
+
+admin
+  .command('open')
+  .description('Open Bridge Console in the default browser')
+  .option('-p, --port <number>', 'server port', '3928')
+  .option('--host <host>', 'server host', '127.0.0.1')
+  .action(async (opts: { port?: string; host?: string }) => {
+    const { runAdminOpen } = await import('./commands/admin');
+    await runAdminOpen({
+      port: opts.port ? Number(opts.port) : 3928,
+      host: opts.host,
+    });
+  });
+
 const secrets = program
   .command('secrets')
   .description('Manage the bridge\'s encrypted secret keystore (~/.lark-channel/secrets.enc)');

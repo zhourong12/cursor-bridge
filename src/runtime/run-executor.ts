@@ -4,6 +4,7 @@ import { ActiveRuns, type RunHandle } from '../bot/active-runs';
 import { ProcessPool } from '../bot/process-pool';
 import type { RunPolicyAllow } from '../policy/run-policy';
 import { log } from '../core/logger';
+import { classifyCursorError } from '../core/diagnostics';
 import { RunRejected, SpawnFailed } from './errors';
 
 export interface RunExecutorDeps {
@@ -163,6 +164,11 @@ export class RunExecutor {
       cleaned = true;
       this.activeRuns.unregister(input.scopeId, run);
       release();
+      log.info('run', 'cleanup', {
+        ...dimensions,
+        waitForExit,
+        interrupted: handle.interrupted,
+      });
       if (waitForExit) {
         const exited = await run.waitForExit(this.postDoneExitGraceMs);
         if (!exited) {
@@ -229,6 +235,7 @@ function observeRunEvents(
             result: event.terminationReason,
             durationMs: opts.now() - opts.startedAt,
             error: event.message,
+            errorKind: classifyCursorError(event.message),
           });
           yield event;
           return;

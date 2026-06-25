@@ -1,5 +1,5 @@
-import { readAndPrune, resolveTarget, isAlive } from '../../runtime/registry';
-import type { ProcessEntry } from '../../runtime/registry';
+import { readAndPrune, resolveTarget } from '../../runtime/registry';
+import { stopProcessEntry, type StopProcessEntryResult } from '../../runtime/process-control';
 
 /**
  * Pretty-print the list of running lark-channel-bridge processes.
@@ -22,12 +22,13 @@ export function runPs(): void {
       idx: String(idx + 1),
       id: e.id,
       pid: String(e.pid),
+      profile: e.profileName ?? '-',
       app,
       started: ago,
       version: e.version,
     };
   });
-  const headers = { idx: '#', id: 'ID', pid: 'PID', app: 'Bot', started: '启动', version: '版本' };
+  const headers = { idx: '#', id: 'ID', pid: 'PID', profile: 'Profile', app: 'Bot', started: '启动', version: '版本' };
   printTable([headers, ...rows]);
 }
 
@@ -58,32 +59,8 @@ export async function runKillCli(target: string | undefined): Promise<void> {
   console.log(`✓ 已关闭 bot ${entry.id}。`);
 }
 
-export type StopProcessEntryResult = 'terminated' | 'killed';
-
-export async function stopProcessEntry(
-  entry: Pick<ProcessEntry, 'pid'> & { id?: string },
-  timeoutMs = 2000,
-): Promise<StopProcessEntryResult> {
-  process.kill(entry.pid, 'SIGTERM');
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isAlive(entry.pid)) {
-      return 'terminated';
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-
-  process.kill(entry.pid, 'SIGKILL');
-  const forceDeadline = Date.now() + timeoutMs;
-  while (Date.now() < forceDeadline) {
-    if (!isAlive(entry.pid)) {
-      return 'killed';
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error(`process ${entry.pid} did not exit after SIGKILL`);
-}
+export type { StopProcessEntryResult } from '../../runtime/process-control';
+export { stopProcessEntry } from '../../runtime/process-control';
 
 function formatAgo(ms: number): string {
   if (ms < 60_000) return `${Math.floor(ms / 1000)}s 前`;

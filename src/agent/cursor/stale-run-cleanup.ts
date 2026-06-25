@@ -2,6 +2,7 @@ import { Agent, SqliteLocalAgentStore, getDefaultSdkStateRoot } from '@cursor/sd
 import type { Run, SDKAgent } from '@cursor/sdk';
 
 import { log } from '../../core/logger';
+import { classifyCursorError } from '../../core/diagnostics';
 import type { SessionCatalog } from '../../session/catalog';
 
 const ACTIVE_RUN_CONFLICT = /already has active run/i;
@@ -163,6 +164,21 @@ export async function cancelRunningRunsForAgent(
   return cancelled;
 }
 
+/** Cancel runs + clear locks when ending a Cursor chat session (/new). */
+export async function releaseCursorSessionResources(
+  agentId: string,
+  cwd: string,
+  event = 'session-released',
+): Promise<void> {
+  log.info('cursor', 'session-release-begin', { agentId, event });
+  const cancelled = await cancelRunningRunsForAgent(agentId, cwd, event);
+  let locksCleared = 0;
+  for (const workspaceRef of workspaceRefs(cwd)) {
+    if (await clearAgentActiveRunLock(agentId, workspaceRef)) locksCleared++;
+  }
+  log.info('cursor', 'session-release-done', { agentId, cancelled, locksCleared, event });
+}
+
 /** Cancel runs + clear agent.activeRunId in store; reload agent only on conflict retry. */
 export async function recoverActiveRunConflict(agent: SDKAgent, cwd: string): Promise<void> {
   await cancelRunningRunsForAgent(agent.agentId, cwd, 'conflict-cancelled');
@@ -185,10 +201,28 @@ export function sendWithActiveRunRetry(
     try {
       return await agent.send(prompt);
     } catch (err) {
-      if (!isActiveRunConflict(err)) throw err;
+      if (!isActiveRunConflict(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.warn('cursor', 'send-failed', {
+          agentId: agent.agentId,
+          errorKind: classifyCursorError(message),
+          message: message.slice(0, 240),
+        });
+        throw err;
+      }
       log.warn('cursor', 'active-run-conflict-retry', { agentId: agent.agentId, cwd });
       await recoverActiveRunConflict(agent, cwd);
-      return await agent.send(prompt);
+      try {
+        return await agent.send(prompt);
+      } catch (retryErr) {
+        const message = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        log.warn('cursor', 'send-retry-failed', {
+          agentId: agent.agentId,
+          errorKind: classifyCursorError(message),
+          message: message.slice(0, 240),
+        });
+        throw retryErr;
+      }
     }
   })();
   void promise.catch(() => {
@@ -221,6 +255,7 @@ export async function cleanupStaleCursorRuns(catalog: SessionCatalog): Promise<v
       cancelled,
       locksCleared,
       agents: targets.size,
+      agentIds: [...targets.keys()],
     });
   }
 }

@@ -24,6 +24,7 @@ export async function handleSchedule(args: string, ctx: CommandContext): Promise
         '**定时任务**（进程内调度，bridge 常驻时生效）',
         '',
         '- `/schedule add <分> <时> <日> <月> <周> <prompt...>` — 登记任务',
+        '- 可选后缀：`--silent`（不发结果）、`--dispatch @bot名`（完成后委派给另一 bot）',
         '- `/schedule list` — 查看本 profile 任务',
         '- `/schedule remove <id>` — 删除任务',
         '',
@@ -63,7 +64,19 @@ export async function handleSchedule(args: string, ctx: CommandContext): Promise
   }
 
   if (sub === 'add') {
-    const raw = rest.join(' ').trim();
+    let raw = rest.join(' ').trim();
+    let silent = false;
+    let dispatchTarget: string | undefined;
+    const silentIdx = raw.indexOf('--silent');
+    if (silentIdx >= 0) {
+      silent = true;
+      raw = (raw.slice(0, silentIdx) + raw.slice(silentIdx + '--silent'.length)).trim();
+    }
+    const dispatchMatch = raw.match(/--dispatch\s+(\S+)/);
+    if (dispatchMatch) {
+      dispatchTarget = dispatchMatch[1]?.replace(/^@/, '');
+      raw = raw.replace(dispatchMatch[0], '').trim();
+    }
     const parts = raw.split(/\s+/);
     if (parts.length < 6) {
       await reply(
@@ -100,6 +113,8 @@ export async function handleSchedule(args: string, ctx: CommandContext): Promise
       chatId: ctx.msg.chatId,
       cwd: cwdRealpath,
       creatorId: ctx.msg.senderId,
+      ...(silent ? { silent: true } : {}),
+      ...(dispatchTarget ? { dispatch: { target: dispatchTarget } } : {}),
     });
     await reply(
       ctx,
@@ -108,6 +123,8 @@ export async function handleSchedule(args: string, ctx: CommandContext): Promise
         `- cron: \`${cron}\``,
         `- 工作区: \`${cwdRealpath ?? '默认'}\``,
         `- 结果将发回本会话`,
+        ...(silent ? ['- 静默: 是（不向飞书发结果）'] : []),
+        ...(dispatchTarget ? [`- 委派: \`${dispatchTarget}\`（完成后结构化 @）`] : []),
         '',
         '删除：`/schedule remove ' + task.id + '`',
       ].join('\n'),

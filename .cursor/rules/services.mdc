@@ -1,0 +1,118 @@
+---
+description: 三类服务定义（Bot 运行时 / Console Electron / Console Web）及启动互斥；回答启动、多窗口、端口、多 Bot 问题时必遵
+alwaysApply: true
+---
+
+# 三类服务（必须区分，禁止混为一谈）
+
+本仓库有 **三个独立服务**。它们职责、进程、端口、启动入口 **各不相同**。  
+回答用户「怎么启动」「为什么两个窗口」「连了几个 bot」时，先判断用户指的是哪一类。
+
+---
+
+## 1. Bridge Bot 运行时（飞书 ↔ Agent）
+
+| 项 | 说明 |
+|----|------|
+| **是什么** | 真正连飞书、跑 Cursor/Claude Agent、处理 `/schedule` 的 **Bot 进程** |
+| **不是什么** | 不是管理网页；**没有**给用户点的 Console 窗口；**不占** 3928 管理端口 |
+| **进程** | 每个 Profile 一个 `node`（`lark-channel-bridge run` 或后台 daemon） |
+| **数据** | `~/.lark-channel/`、`fleet.json`、`registry/processes.json` |
+
+### 启动方式（二选一或并存多个 profile）
+
+| 模式 | 适用 | 入口 |
+|------|------|------|
+| **单 Bot 前台** | 开发调试、只跑 active profile | `start.bat` → `npm run lark-bridge:cursor` |
+| **单 Bot 重启** | 改 `src/` 后 | `restart.bat` → `npm run lark-bridge:restart` |
+| **Fleet 多 Bot** | 多个 Profile 同时在线 | `fleet-restart.bat` → `npm run lark-bridge:fleet-restart` |
+
+Fleet 说明：
+
+- 配置在 `~/.lark-channel/fleet.json`（`autoStart`、`bots`）
+- `fleet start` 按 **profile** 拉起多个 Bot 进程，**不是** 多开端口、也不是多开 Console
+- 启动后终端应看到各 Bot 连接信息；汇总：`lark-channel-bridge fleet status --all`
+
+**与 Console 关系**：Bot 可单独跑；Console 只是管理 Bot/Fleet，**不会**代替 `fleet start` 或 `lark-bridge:cursor` 自动起 Bot。
+
+---
+
+## 2. Bridge Console · Electron（桌面管理壳）
+
+| 项 | 说明 |
+|----|------|
+| **是什么** | 本地 **管理界面**：概览、Bot 绑定、Fleet、进程、定时任务、日志 |
+| **不是什么** | 不是飞书 Bot；打开它 **不会** 自动连接飞书 |
+| **端口** | 内嵌 HTTP **3928**（仅本机） |
+| **窗口** | **1 个** Electron 窗口 |
+
+### 启动
+
+```powershell
+.\run-console.cmd
+# 或 npm run console:run
+# 开发：npm run console（electron desktop/electron-main.cjs）
+```
+
+打包：`npm run pack:console` → `release/win-unpacked/Bridge Console.exe`
+
+---
+
+## 3. Bridge Console · Web（浏览器管理）
+
+| 项 | 说明 |
+|----|------|
+| **是什么** | 与 Electron **同一套** Admin API + 静态页，用 **浏览器** 打开 |
+| **不是什么** | 不是第三个 Bot；不是「多开一个飞书连接」 |
+| **端口** | HTTP **3928**（与 Electron Console **共用**，同时只能有一个监听） |
+| **窗口** | **1 个** 浏览器标签/窗口（脚本 `--open` 自动打开） |
+
+### 启动
+
+```powershell
+.\console-web.bat
+# 或 npm run console:web:build
+```
+
+登录：`http://127.0.0.1:3928/?token=<admin-token>`（token 在 `~/.lark-channel/admin-token`）
+
+---
+
+## 互斥与常见误区
+
+| 误区 | 正确说法 |
+|------|----------|
+| 「开了 Console = Bot 已上线」 | **错误**。Console 只是管理 UI；Bot 需 **Bot 运行时** 或 **Fleet** 单独启动 |
+| 「3928 / 3930 各开一个 = 两个 Bot」 | **错误**。那是 **Console 管理端口**；多端口 = 多个 Console 实例，不是多个 Bot |
+| 「Electron + 浏览器 = 两个 Bot」 | **错误**。是 **Console Electron + Console Web** 各一个界面；应 **二选一** |
+| 「Fleet 多 Bot = 多个 Console」 | **错误**。Fleet = 多个 **Bot 进程**；Console 仍然只需 **一个**（Electron 或 Web） |
+
+### 同端口互斥（3928）
+
+- **Console Electron** 与 **Console Web** 不能同时占 3928
+- 启动脚本会先停旧 listener；仍建议用户只选一种 Console 方式
+- **Bot 运行时** 不占 3928，可与 Console **同时存在**（推荐日常：Console 管理 + Fleet 起 Bot）
+
+---
+
+## 推荐日常组合
+
+```text
+管理界面（二选一）:
+  run-console.cmd          # Electron
+  console-web.bat          # 浏览器
+
+飞书 Bot（按需）:
+  fleet-restart.bat        # 多 Bot（生产）
+  start.bat / restart.bat  # 单 Bot 前台（开发）
+```
+
+---
+
+## 助手回答 checklist
+
+1. 用户说「启动 bridge」→ 先问/判断：要 **Bot** 还是 **Console**？
+2. 用户说「两个窗口」→ 是否 **Electron + 浏览器** 或 **混用了 console-web 与 run-console**？
+3. 用户说「几个 bot 连接」→ 看 **Bot 运行时**（`fleet status` / Console 概览进程表），不是 Console 窗口个数
+4. 改 `src/admin` 或 Console → `npm run build`；改 Electron 打包 → `pack:console`
+5. **禁止** 建议「多开几个 port 就能多 Bot」

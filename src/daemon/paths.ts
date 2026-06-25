@@ -79,6 +79,11 @@ export function windowsLauncherCmdPath(profile: string = paths.profile): string 
   return join(paths.appDir, 'daemon', serviceProfileId(profile), 'launcher.cmd');
 }
 
+/** Hidden wrapper so schtasks /Run does not flash a console per profile. */
+export function windowsLauncherVbsPath(profile: string = paths.profile): string {
+  return join(paths.appDir, 'daemon', serviceProfileId(profile), 'launcher.vbs');
+}
+
 // === Daemon log paths (platform-agnostic) ===
 
 /**

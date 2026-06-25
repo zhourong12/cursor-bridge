@@ -1,4 +1,5 @@
 import type { AgentRun } from '../agent/types';
+import { log } from '../core/logger';
 
 export interface RunHandle {
   run: AgentRun;
@@ -69,6 +70,18 @@ export class ActiveRuns {
     return [...this.handles.keys()];
   }
 
+  isScopeBusy(scopeId: string): boolean {
+    return this.handles.has(scopeId) || this.reservations.has(scopeId);
+  }
+
+  async waitForScope(scopeId: string, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.isScopeBusy(scopeId)) {
+      if (Date.now() >= deadline) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
   /**
    * Interrupt the current run for this chat, if any. Returns true if an
    * interrupt was issued. Fires stop() fire-and-forget — the old run's
@@ -80,6 +93,7 @@ export class ActiveRuns {
     this.reservations.delete(chatId);
     h.interrupted = true;
     this.handles.delete(chatId);
+    log.info('run', 'interrupt', { scope: chatId });
     void h.run.stop().catch(() => {
       /* stop errors are non-fatal */
     });

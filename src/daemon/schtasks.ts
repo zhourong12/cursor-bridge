@@ -8,8 +8,11 @@ import {
   daemonStdoutPath,
   windowsTaskName,
   windowsLauncherCmdPath,
+  windowsLauncherVbsPath,
 } from './paths';
 import { paths } from '../config/paths';
+import { log } from '../core/logger';
+import { secretFingerprint } from '../core/diagnostics';
 import { collectDaemonExtraEnv, type DaemonExtraEnv } from './env';
 
 export interface LauncherInputs {
@@ -43,12 +46,26 @@ export function buildLauncherCmd(inputs: LauncherInputs): string {
   const extraEnvLines = Object.entries(inputs.extraEnv ?? {}).map(
     ([key, value]) => `set "${key}=${value}"`,
   );
+  const stdout = daemonStdoutPath(inputs.profile);
+  const stderr = daemonStderrPath(inputs.profile);
   return [
     '@echo off',
     `set "LARK_CHANNEL_HOME=${inputs.channelHome}"`,
     `set "PATH=${inputs.envPath}"`,
     ...extraEnvLines,
-    `"${inputs.nodePath}" "${inputs.bridgeEntryPath}" run --profile "${inputs.profile}" >> "${daemonStdoutPath(inputs.profile)}" 2>> "${daemonStderrPath(inputs.profile)}"`,
+    // /B: detach node so this cmd exits; schtasks would otherwise keep one console per profile.
+    `start /B "" "${inputs.nodePath}" "${inputs.bridgeEntryPath}" run --profile "${inputs.profile}" >> "${stdout}" 2>> "${stderr}"`,
+    'exit /b 0',
+    '',
+  ].join('\r\n');
+}
+
+/** Run launcher.cmd with window style 0 (hidden). */
+export function buildLauncherVbs(cmdPath: string): string {
+  const escaped = cmdPath.replace(/"/g, '""');
+  return [
+    'Set shell = CreateObject("Wscript.Shell")',
+    `shell.Run "cmd /c ""${escaped}""", 0, False`,
     '',
   ].join('\r\n');
 }
@@ -67,9 +84,17 @@ async function writeLauncherCmd(profile: string): Promise<void> {
     extraEnv: collectDaemonExtraEnv(),
   });
   const cmdPath = windowsLauncherCmdPath(profile);
+  const vbsPath = windowsLauncherVbsPath(profile);
   await mkdir(dirname(cmdPath), { recursive: true });
   await mkdir(daemonLogDir(profile), { recursive: true });
   await writeFile(cmdPath, content, 'utf8');
+  await writeFile(vbsPath, buildLauncherVbs(cmdPath), 'utf8');
+  const fp = secretFingerprint(inputs.extraEnv?.CURSOR_API_KEY ?? process.env.CURSOR_API_KEY);
+  log.info('daemon', 'launcher-written', {
+    profile: inputs.profile,
+    cmdPath,
+    cursorApiKey: fp,
+  });
 }
 
 interface SchtasksResult {
@@ -97,6 +122,7 @@ function runSchtasks(args: string[]): SchtasksResult {
  */
 export async function installTask(profile: string): Promise<SchtasksResult> {
   await writeLauncherCmd(profile);
+  const vbsPath = windowsLauncherVbsPath(profile);
   return runSchtasks([
     '/Create',
     '/F',
@@ -107,7 +133,7 @@ export async function installTask(profile: string): Promise<SchtasksResult> {
     '/TN',
     windowsTaskName(profile),
     '/TR',
-    `"${windowsLauncherCmdPath(profile)}"`,
+    `wscript.exe //B "${vbsPath}"`,
   ]);
 }
 
@@ -190,6 +216,9 @@ export async function deleteTask(profile: string): Promise<SchtasksResult> {
   // Remove the launcher script too; best-effort.
   if (existsSync(windowsLauncherCmdPath(profile))) {
     await rm(windowsLauncherCmdPath(profile), { force: true });
+  }
+  if (existsSync(windowsLauncherVbsPath(profile))) {
+    await rm(windowsLauncherVbsPath(profile), { force: true });
   }
   return r;
 }

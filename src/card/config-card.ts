@@ -5,6 +5,7 @@ import type { MessageReplyMode } from '../config/schema';
 export interface ConfigFormOpts {
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
+  showThinking: boolean;
   maxConcurrentRuns: number;
   /** 0 means "disabled". */
   runIdleTimeoutMinutes: number;
@@ -141,6 +142,22 @@ export function configFormCard(opts: ConfigFormOpts): object {
             {
               tag: 'markdown',
               content:
+                '\n**思考过程显示**\n' +
+                '_显示(默认):运行中显示「思考中」,card 模式可展开查看详情_\n' +
+                '_隐藏:不展示 agent 内部思考内容_',
+            },
+            {
+              tag: 'select_static',
+              name: 'show_thinking',
+              initial_option: opts.showThinking ? 'show' : 'hide',
+              options: [
+                { text: { tag: 'plain_text', content: '显示(默认)' }, value: 'show' },
+                { text: { tag: 'plain_text', content: '隐藏' }, value: 'hide' },
+              ],
+            },
+            {
+              tag: 'markdown',
+              content:
                 '\n**并发上限**\n' +
                 '_全局同时运行的 agent 进程数(主要影响话题群多话题并行场景)_\n' +
                 '_默认 10,范围 1-50。超出的请求会 FIFO 排队_',
@@ -261,6 +278,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             '✅ **偏好已保存**\n\n' +
             `**消息回复方式**:${replyLabel}\n` +
             `**工具调用显示**:\`${opts.showToolCalls ? 'show' : 'hide'}\`\n` +
+            `**思考过程显示**:\`${opts.showThinking ? 'show' : 'hide'}\`\n` +
             `**并发上限**:\`${opts.maxConcurrentRuns}\`\n` +
             `**run 探活**:\`${opts.runIdleTimeoutMinutes > 0 ? `${opts.runIdleTimeoutMinutes} 分钟` : '关闭'}\`\n` +
             `**群里需要 @ bot**:\`${opts.requireMentionInGroup ? '是' : '否'}\`\n\n` +

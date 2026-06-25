@@ -8,11 +8,9 @@ import { toolHeaderText } from './tool-render';
  * Differences vs `renderCard`:
  *   - No collapsible panels, no buttons (markdown messages have neither)
  *   - Tool calls collapse to a single short line each (no body)
- *   - Reasoning is rendered as a blockquote section (no fold UI in Feishu markdown)
+ *   - Reasoning shows a one-line "thinking" indicator while active; hidden when done
  *   - Footer is appended inline at the bottom while running
  */
-const REASONING_MAX = 4000;
-
 export function renderText(state: RunState): string {
   const parts: string[] = [];
 
@@ -44,21 +42,8 @@ function shouldShowFooter(state: RunState): boolean {
 }
 
 function renderReasoning(reasoning: RunState['reasoning']): string | null {
-  const content = reasoning.content.trim();
-  if (!content && !reasoning.active) return null;
-
-  const title = reasoning.active ? '🧠 **思考中**' : '🧠 **思考过程**';
-  if (!content) return `_${title}…_`;
-
-  const body = truncate(content, REASONING_MAX)
-    .split('\n')
-    .map((line) => `> ${line}`)
-    .join('\n');
-  return `> ${title}\n>\n${body}`;
-}
-
-function truncate(s: string, max: number): string {
-  return s.length > max ? `${s.slice(0, max)}…` : s;
+  if (!reasoning.active) return null;
+  return '_🧠 思考中…_';
 }
 
 function renderBlock(block: Block): string {

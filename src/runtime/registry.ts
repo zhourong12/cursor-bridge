@@ -47,6 +47,8 @@ export interface ProcessEntry {
    * WS handshake — undefined until the connection is up, or on processes
    * registered by older versions of the bridge. */
   botName?: string;
+  /** Bot open_id (ou_xxx), filled after WS handshake for fleet @mention sync. */
+  botOpenId?: string;
 }
 
 interface RegistryFile {
@@ -166,7 +168,7 @@ export async function unregister(id: string, registryFile: string = paths.proces
  */
 export async function updateEntry(
   id: string,
-  patch: Partial<Pick<ProcessEntry, 'appId' | 'tenant' | 'configPath' | 'botName'>>,
+  patch: Partial<Pick<ProcessEntry, 'appId' | 'tenant' | 'configPath' | 'botName' | 'botOpenId'>>,
   registryFile: string = paths.processesFile,
 ): Promise<void> {
   await withRegistryFileLock(registryFile, async () => {

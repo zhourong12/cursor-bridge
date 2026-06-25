@@ -20,6 +20,7 @@ import { resolveAppSecret } from '../../config/secret-resolver';
 import { writeFileAtomic } from '../../platform/atomic-write';
 import { acquireProfileRuntimeLock, checkRuntimeLock } from '../../runtime/locks';
 import { readAndPrune } from '../../runtime/registry';
+import { getServiceAdapter } from '../../daemon/service-adapter';
 import { listAllProfiles } from '../../runtime/profile-discovery';
 import { resolveProfileRuntime } from '../../runtime/profile-runtime';
 
@@ -65,23 +66,29 @@ export async function runProfileList(opts: ProfileCommandOptions = {}): Promise<
     const holders = running
       .filter((entry) => entry.profileName === profile.name)
       .map((entry) => `pid=${entry.pid} agent=${entry.agentKind}`);
+    const adapter = getServiceAdapter(profile.name);
+    const daemon =
+      adapter?.isRunning() ? 'running' : adapter?.fileExists() ? 'registered' : '-';
     return {
       active: profile.active ? '*' : '',
       profile: profile.name,
       agent: profile.agentKind,
       status: holders.length > 0 ? holders.join(', ') : '-',
+      daemon,
     };
   });
   const widths = {
     active: Math.max('ACTIVE'.length, ...rows.map((row) => row.active.length)),
     profile: Math.max('PROFILE'.length, ...rows.map((row) => row.profile.length)),
     agent: Math.max('AGENT'.length, ...rows.map((row) => row.agent.length)),
+    daemon: Math.max('DAEMON'.length, ...rows.map((row) => row.daemon.length)),
   };
   console.log(formatProfileListRow({
     active: 'ACTIVE',
     profile: 'PROFILE',
     agent: 'AGENT',
     status: 'STATUS',
+    daemon: 'DAEMON',
   }, widths));
   for (const row of rows) {
     console.log(formatProfileListRow(row, widths));
@@ -89,14 +96,15 @@ export async function runProfileList(opts: ProfileCommandOptions = {}): Promise<
 }
 
 function formatProfileListRow(
-  row: { active: string; profile: string; agent: string; status: string },
-  widths: { active: number; profile: number; agent: number },
+  row: { active: string; profile: string; agent: string; status: string; daemon?: string },
+  widths: { active: number; profile: number; agent: number; daemon?: number },
 ): string {
   return [
     row.active.padEnd(widths.active),
     row.profile.padEnd(widths.profile),
     row.agent.padEnd(widths.agent),
-    row.status,
+    row.status.padEnd(Math.max('STATUS'.length, 6)),
+    row.daemon ?? '-',
   ].join('  ');
 }
 

@@ -5,6 +5,7 @@ import type {
 } from '@larksuiteoapi/node-sdk';
 import { Domain, LoggerLevel, createLarkChannel } from '@larksuiteoapi/node-sdk';
 import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   claudeCapability,
   codexCapability,
@@ -39,10 +40,12 @@ import {
   getMessageReplyMode,
   getRequireMentionInGroup,
   getRunIdleTimeoutMs,
+  getShowThinking,
   getShowToolCalls,
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
 import { log, reportMetric, withTrace } from '../core/logger';
+import { classifyCursorError } from '../core/diagnostics';
 import { MediaCache, type LocalAttachment } from '../media/cache';
 import {
   toPolicyAttachment,
@@ -69,10 +72,25 @@ import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, type QuotedContext } from './quote';
 import { addWorkingReaction, removeReaction } from './reaction';
 import { extractLocalImagePaths, sendSupplementaryImages } from './supplementary-images';
-import { deliverSupplementaryAuthOnce, type AuthDeliveryGate } from './supplementary-auth';
-import { toolOutputNeedsAuthDelivery } from '../agent/bridge-auth-rules';
 import { fetchKnownChats } from './lark-info';
 import type { MessageLifecycleStage } from './lifecycle';
+import { fleetPeersForProfile, loadFleetConfig } from '../fleet/load';
+import type { FleetConfig, FleetPeer } from '../fleet/schema';
+import { readAndPrune } from '../runtime/registry';
+import {
+  handoffExceeded,
+  nextHandoffHop,
+  parseHandoffFromText,
+  resolveHandoffTarget,
+  stripHandoffFromText,
+} from '../fleet/handoff';
+import { sendWithMentions } from './send-with-mentions';
+import { startCursorWatchdog } from './cursor-watchdog';
+import {
+  bindBotRuntimeStats,
+  createBotRuntimeStats,
+  touchRunStats,
+} from '../runtime/bot-runtime-stats';
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
@@ -188,6 +206,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
   const isCurrent = deps.isCurrent ?? (() => true);
   const activeRuns = new ActiveRuns();
+  const rootDir = resolveAppPaths({ profile: controls.profile }).rootDir;
+  const fleetConfig = await loadFleetConfig(rootDir);
+  const fleetPeers = fleetPeersForProfile(fleetConfig, controls.profile);
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
   const chatModeCache = new ChatModeCache();
@@ -195,6 +216,26 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // so /config bumps take effect for the next run.
   const pool = new ProcessPool(() => getMaxConcurrentRuns(controls.cfg));
   const executor = new RunExecutor({ agent, pool, activeRuns });
+
+  const profilePaths = resolveAppPaths({ profile: controls.profile });
+  const runtimeStats = createBotRuntimeStats(profilePaths.profileDir);
+  bindBotRuntimeStats(runtimeStats);
+  runtimeStats.startPersist();
+  const updateRuntimeObs = (): void => {
+    runtimeStats.updateObservability(pool.snapshot().active, activeRuns.snapshot().length);
+  };
+  updateRuntimeObs();
+  const runtimeObsTimer = setInterval(updateRuntimeObs, 30_000);
+  runtimeObsTimer.unref();
+  const cursorWatchdog =
+    agent.id === 'cursor' && sessionCatalog
+      ? startCursorWatchdog({
+          sessionCatalog,
+          profileDir: profilePaths.profileDir,
+          agentKind: controls.profileConfig.agentKind ?? 'cursor',
+          stats: runtimeStats,
+        })
+      : { stop() {} };
 
   // Apply network-layer overrides (HTTP timeout + proxy from env). Idempotent;
   // safe to call on every startChannel (used by /account change hot-reload too).
@@ -295,12 +336,16 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           activePolicyFingerprints,
           scope,
           mode,
+          fleetConfig,
+          fleetPeers,
         });
       } catch (err) {
         log.fail('flush', err);
       } finally {
-        pending.unblock(scope);
-        log.info('flush', 'end');
+        void activeRuns.waitForScope(scope).then(() => {
+          pending.unblock(scope);
+          log.info('flush', 'end');
+        });
       }
     });
   });
@@ -446,12 +491,25 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       ...(identity.name ? { name: identity.name } : {}),
     });
   }
+  const registry = readAndPrune(resolveAppPaths({ rootDir }).userRegistryFile);
+  const namedOnline = registry.filter((e) => Boolean(e.botName)).length;
+  const selfNamed = registry.some((e) => e.pid === process.pid && e.botName);
+  const fleetOnline =
+    namedOnline + (identity?.name && !selfNamed ? 1 : 0);
+
   log.info('ws', 'connected', {
     bot: identity?.name ?? 'unknown',
     openId: identity?.openId ?? '-',
     agent: `${agent.displayName} (${agent.id})`,
     appId: cfg.accounts.app.id,
     procId: controls.processId,
+    ...(fleetPeers.length > 0
+      ? {
+          fleetPeers: fleetPeers.length,
+          fleetPeerNames: fleetPeers.map((p) => p.name).join(', '),
+        }
+      : {}),
+    fleetOnline,
   });
   console.log('正在监听消息。按 Ctrl+C 退出。\n');
 
@@ -468,11 +526,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     forceReconnect: () => controls.restart(),
   });
 
-  const profilePaths = resolveAppPaths({ profile: controls.profile });
   const scheduleTimer = startScheduleTimer({
     channel,
     agent,
     profileDir: profilePaths.profileDir,
+    profileName: controls.profile,
     profileConfig: controls.profileConfig,
   });
 
@@ -480,6 +538,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     channel,
     disconnect: async () => {
       activeRuns.pauseNewRuns('bridge-disconnect');
+      cursorWatchdog.stop();
+      clearInterval(runtimeObsTimer);
+      runtimeStats.stopPersist();
+      bindBotRuntimeStats(undefined);
       ownerRefresh.stop();
       knownChatsRefresh.stop();
       keepalive.stop();
@@ -725,6 +787,8 @@ interface RunBatchDeps {
   activePolicyFingerprints: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  fleetConfig: FleetConfig;
+  fleetPeers: FleetPeer[];
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -741,6 +805,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     activePolicyFingerprints,
     scope,
     mode,
+    fleetConfig,
+    fleetPeers,
   } = deps;
   if (batch.length === 0) return;
   const firstMsg = batch[0];
@@ -792,7 +858,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
-  const prompt = buildPrompt(batch, attachments, quotes, channel.botIdentity);
+  const prompt = buildPrompt(batch, attachments, quotes, channel.botIdentity, fleetPeers);
   log.info('prompt', 'built', { promptChars: prompt.length, quotes: quotes.length });
 
   // For topic groups: thread the reply so it lands in the same topic as the
@@ -864,7 +930,21 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
   } else {
-    log.info('session', 'fresh', { cwd });
+    log.info('session', 'fresh', { cwd, ...(flow.cursorIdleReset ? { cursorIdleReset: true } : {}) });
+  }
+  if (flow.cursorIdleReset) {
+    try {
+      await channel.send(
+        chatId,
+        {
+          markdown:
+            '💡 距上次对话已较久，已自动开启新的 Agent 上下文（飞书聊天记录保留，Cursor 侧不继承此前会话）。',
+        },
+        sendOpts,
+      );
+    } catch (err) {
+      log.warn('session', 'idle-reset-notice-failed', { err: String(err) });
+    }
   }
   const recordSession = (evt: AgentEvent): void => {
     recordRunSessionEvent({
@@ -900,31 +980,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   log.info('flush', 'reply-mode', { mode: replyMode });
 
   const appPaths = resolveAppPaths({ profile: controls.profile });
-  const authDeliveryGate: AuthDeliveryGate = { delivered: false };
-  const authDeliveryBase = {
-    channel,
-    chatId,
-    sendOpts,
-    profileDir: appPaths.profileDir,
-    larkCliConfigDir: appPaths.larkCliConfigDir,
-  };
-  const onAuthToolOutput = async (output: string): Promise<void> => {
-    await deliverSupplementaryAuthOnce(authDeliveryGate, authDeliveryBase, [output]);
-  };
-  const finalizeAuthDelivery = async (state: RunState): Promise<void> => {
-    const runTexts = state.blocks.flatMap((b) => {
-      if (b.kind === 'tool' && b.tool.output) return [b.tool.output];
-      if (b.kind === 'text' && b.content) return [b.content];
-      return [];
-    });
-    await deliverSupplementaryAuthOnce(authDeliveryGate, authDeliveryBase, runTexts);
-  };
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
   const filterForPrefs = (state: RunState): RunState => {
-    if (getShowToolCalls(controls.cfg)) return state;
-    return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
+    let next = state;
+    if (!getShowToolCalls(controls.cfg)) {
+      next = { ...next, blocks: next.blocks.filter((b) => b.kind !== 'tool') };
+    }
+    if (!getShowThinking(controls.cfg)) {
+      next = { ...next, reasoning: { content: '', active: false } };
+    }
+    return next;
   };
   const cardRenderOptions = callbackAuth
     ? {
@@ -982,9 +1049,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             }
           }
         },
-        undefined,
-        undefined,
-        onAuthToolOutput,
       );
       const streamDone = channel.stream(
         chatId,
@@ -1031,7 +1095,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           );
         },
       });
-      await finalizeAuthDelivery(await renderDone);
+      const cardFinalState = await renderDone;
+      await tryExecuteHandoffs(channel, chatId, fleetConfig, cardFinalState, sendOpts);
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let producerStarted = false;
@@ -1055,7 +1120,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
         supplementaryImages,
         cwd,
-        onAuthToolOutput,
       );
       const streamDone = channel.stream(
         chatId,
@@ -1082,7 +1146,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
       });
       const finalState = await renderDone;
-      await finalizeAuthDelivery(finalState);
       const imageCount = await sendSupplementaryImages({
         channel,
         chatId,
@@ -1099,6 +1162,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       if (imageCount > 0) {
         log.info('supplementary-image', 'batch-sent', { count: imageCount });
       }
+      await tryExecuteHandoffs(channel, chatId, fleetConfig, finalState, sendOpts);
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
@@ -1110,23 +1174,39 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         idleTimeoutMs,
         recordSession,
         async () => {},
-        undefined,
-        undefined,
-        onAuthToolOutput,
       );
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
         await channel.send(chatId, { markdown: body }, sendOpts);
       }
-      await finalizeAuthDelivery(finalState);
+      await tryExecuteHandoffs(channel, chatId, fleetConfig, finalState, sendOpts);
     }
   } catch (err) {
     streamFailed = true;
     for (const msg of batch) {
       recordLifecycle(controls, msg, scope, 'failed', undefined, err instanceof Error ? err.message : String(err));
     }
-    log.fail('stream', err);
+    const detail = err instanceof Error ? err.message : String(err);
+    log.fail('stream', err, {
+      scope,
+      replyMode,
+      agent: capability.agentId,
+      sessionId: flow.resumeFrom,
+      errorKind: classifyCursorError(detail),
+    });
+    const body =
+      /api key exchange|fetch failed|agent-version-check/i.test(detail)
+        ? `❌ **Cursor Agent 无法连接**（API key exchange 失败）。\n\n请检查：本机网络/代理、Cursor 是否已登录、daemon 进程是否继承到 \`CURSOR_API_KEY\`。修复后在 Console **Fleet → 重启 Fleet**，或发 \`/exit\` 取消当前卡住的任务。\n\n\`${detail}\``
+        : `❌ Agent 运行失败：${detail}`;
+    try {
+      await channel.send(chatId, { markdown: body }, sendOpts);
+    } catch (sendErr) {
+      log.warn('stream', 'error-reply-failed', { err: String(sendErr) });
+    }
   } finally {
+    if (capability.agentId === 'cursor') {
+      touchRunStats(!streamFailed);
+    }
     if (!streamFailed) {
       for (const msg of batch) recordLifecycle(controls, msg, scope, 'completed');
     }
@@ -1149,7 +1229,6 @@ async function processAgentStream(
   flush: (state: RunState) => Promise<void>,
   supplementaryImages?: Set<string>,
   cwd?: string,
-  onAuthToolOutput?: (output: string) => Promise<void>,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = { ...initialState, startedAt: runStart };
@@ -1207,11 +1286,6 @@ async function processAgentStream(
           for (const path of extractLocalImagePaths(evt.output, cwd)) {
             supplementaryImages.add(path);
           }
-        }
-        if (onAuthToolOutput && evt.output && toolOutputNeedsAuthDelivery(evt.output)) {
-          void onAuthToolOutput(evt.output).catch((err) => {
-            log.fail('supplementary-auth', err, { step: 'tool-result' });
-          });
         }
       }
       armOrPauseIdle();
@@ -1389,6 +1463,7 @@ function buildPrompt(
   attachments: LocalAttachment[],
   quotes: QuotedContext[] = [],
   botIdentity?: { openId: string; name?: string },
+  fleetPeers: FleetPeer[] = [],
 ): string {
   const first = batch[0];
   if (!first) return '';
@@ -1414,6 +1489,13 @@ function buildPrompt(
 
   const senderType = senderTypeOf(first);
   const mentions = mergeMentions(batch);
+  const fleetInstructions =
+    fleetPeers.length > 0
+      ? [
+          `Fleet 协作 bot（open_id 用于结构化 @，勿纯文本 @）：${fleetPeers.map((p) => `${p.name}=${p.openId ?? '?'}`).join(', ')}`,
+          '委派给其他 bot 时用 /delegate @名字 任务描述，或输出 {"__bridge_handoff":true,"targetBot":"名字","payload":"..."}。',
+        ]
+      : [];
 
   return buildAgentPrompt({
     context: {
@@ -1424,11 +1506,12 @@ function buildPrompt(
       ...(senderType ? { senderType } : {}),
       ...(botIdentity?.openId ? { botOpenId: botIdentity.openId } : {}),
       ...(mentions.length > 0 ? { mentions } : {}),
+      ...(fleetPeers.length > 0 ? { peers: fleetPeers } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
       source: 'im',
     },
-    instructions: BRIDGE_AGENT_INSTRUCTIONS,
+    instructions: [...BRIDGE_AGENT_INSTRUCTIONS, ...fleetInstructions],
     userInput: userPart,
     quotedMessages: quotes.map(toPromptQuote),
     interactiveCards: batch.map(toPromptInteractiveCard).filter(isDefined),
@@ -1538,4 +1621,37 @@ function parseJsonOrRaw(input: string): unknown {
 
 function isDefined<T>(value: T | undefined): value is T {
   return value !== undefined;
+}
+
+async function tryExecuteHandoffs(
+  channel: LarkChannel,
+  chatId: string,
+  fleet: FleetConfig,
+  state: RunState,
+  sendOpts: { replyTo?: string; replyInThread?: boolean },
+): Promise<void> {
+  for (const block of state.blocks) {
+    if (block.kind !== 'text') continue;
+    const handoff = parseHandoffFromText(block.content);
+    if (!handoff) continue;
+    const taskId = handoff.taskId ?? randomUUID().slice(0, 8);
+    const hop = nextHandoffHop(taskId);
+    if (handoffExceeded(taskId, hop)) {
+      log.warn('handoff', 'hop-limit', { taskId, hop });
+      continue;
+    }
+    const target = resolveHandoffTarget(fleet, handoff);
+    if (!target?.openId) {
+      log.warn('handoff', 'no-target', { taskId, targetBot: handoff.targetBot });
+      continue;
+    }
+    const body = handoff.payload?.trim() || stripHandoffFromText(block.content);
+    if (!body) continue;
+    await sendWithMentions(channel, chatId, {
+      markdown: body,
+      at: [{ openId: target.openId, ...(target.name ? { name: target.name } : {}) }],
+      ...(sendOpts.replyTo ? { replyTo: sendOpts.replyTo } : {}),
+      ...(sendOpts.replyInThread ? { replyInThread: true } : {}),
+    });
+  }
 }

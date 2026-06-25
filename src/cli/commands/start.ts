@@ -24,6 +24,7 @@ import {
 import type { AppConfig } from '../../config/schema';
 import { isComplete } from '../../config/schema';
 import { configureLogger, gcOldLogs, log, reportError } from '../../core/logger';
+import { secretFingerprint } from '../../core/diagnostics';
 import { loadTelemetryAdapter, telemetry } from '../../core/telemetry';
 import { gcMediaCache } from '../../media/cache';
 import { preFlightChecks } from '../preflight';
@@ -62,7 +63,8 @@ dns.setDefaultResultOrder('ipv4first');
 // its enclosing scope returned), the rejection bubbles to here. Log and
 // keep the bot alive — losing a single reply is better than crashing.
 process.on('unhandledRejection', (reason) => {
-  log.fail('process', reason, { kind: 'unhandledRejection' });
+  const message = reason instanceof Error ? reason.message : String(reason);
+  log.fail('process', reason, { kind: 'unhandledRejection', message: message.slice(0, 240) });
   reportError(reason, { kind: 'unhandledRejection' });
 });
 process.on('uncaughtException', (err) => {
@@ -128,8 +130,14 @@ export async function runStart(opts: StartOptions): Promise<void> {
   const availability = await checkRuntimeAgentAvailability(agent);
   if (!availability.ok) {
     console.error(formatAgentPreflightDiagnostic(availability.diagnostic));
-    log.warn('agent', 'preflight-failed', { diagnostic: availability.diagnostic });
+    log.warn('agent', 'preflight-failed', {
+      diagnostic: availability.diagnostic,
+      cursorApiKey: secretFingerprint(process.env.CURSOR_API_KEY),
+    });
     process.exit(1);
+  }
+  if (profileConfig.agentKind === 'cursor') {
+    log.info('agent', 'preflight-ok', { cursorApiKey: secretFingerprint(process.env.CURSOR_API_KEY) });
   }
 
   for (;;) {
@@ -150,6 +158,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
 
           if ((cfg.agentKind ?? profileConfig.agentKind) === 'cursor') {
             await cleanupStaleCursorRuns(sessionCatalog);
+            log.info('cursor', 'startup-cleanup-done', { watchdog: 'channel-interval' });
           }
 
         await gcMediaCache(MEDIA_GC_MAX_AGE_MS, appPaths.mediaDir);
@@ -305,6 +314,7 @@ export async function runStart(opts: StartOptions): Promise<void> {
                   tenant: next.accounts.app.tenant,
                   configPath,
                   botName: bridge.channel.botIdentity?.name,
+                  botOpenId: bridge.channel.botIdentity?.openId,
                 }, appPaths.userRegistryFile).catch((err) =>
                   log.warn('registry', 'update-failed', { err: String(err) }),
                 );
@@ -353,8 +363,12 @@ export async function runStart(opts: StartOptions): Promise<void> {
         // done — future starts conflicting on this app can show it in the prompt
         // ("bot 尼莫 (cli_xxx)") instead of just a short id.
         const botName = bridge.channel.botIdentity?.name;
-        if (botName) {
-          await updateEntry(entry.id, { botName }, appPaths.userRegistryFile).catch((err) =>
+        const botOpenId = bridge.channel.botIdentity?.openId;
+        if (botName || botOpenId) {
+          await updateEntry(entry.id, {
+            ...(botName ? { botName } : {}),
+            ...(botOpenId ? { botOpenId } : {}),
+          }, appPaths.userRegistryFile).catch((err) =>
             log.warn('registry', 'update-failed', { step: 'botName', err: String(err) }),
           );
         }

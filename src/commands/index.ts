@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { Cursor } from '@cursor/sdk';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { claudeCapability, codexCapability, type AgentCapabilityId } from '../agent/capability';
+import { releaseCursorSessionResources } from '../agent/cursor/stale-run-cleanup';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import type { MessageLifecycleStore } from '../bot/lifecycle';
@@ -24,6 +25,7 @@ import {
   getMessageReplyMode,
   getRequireMentionInGroup,
   getRunIdleTimeoutMs,
+  getShowThinking,
   getShowToolCalls,
   secretKeyForApp,
 } from '../config/schema';
@@ -75,6 +77,7 @@ import { applyLarkCliIdentityPolicy, hasStructuredLarkCliUserAuth } from '../lar
 import { mergeProcessEnv, spawnProcess } from '../platform/spawn';
 import { sendLarkCliBotImage } from '../bot/lark-cli-im';
 import { handleSchedule } from './schedule.js';
+import { handleDelegate } from './delegate.js';
 
 export interface Controls {
   profile: string;
@@ -178,6 +181,7 @@ const handlers: Record<string, Handler> = {
   '/invite': handleInvite,
   '/remove': handleRemove,
   '/schedule': handleSchedule,
+  '/delegate': handleDelegate,
 };
 
 /**
@@ -317,6 +321,13 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
 
   const wasRunning = ctx.activeRuns.interrupt(ctx.scope);
   if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
+    if (ctx.agent.id === 'cursor') {
+      const entry = ctx.sessionCatalog.activeFor(ctx.sessionCatalogIdentity);
+      const agentId = entry?.cursorAgentId?.trim();
+      if (agentId && entry?.cwdRealpath) {
+        await releaseCursorSessionResources(agentId, entry.cwdRealpath);
+      }
+    }
     ctx.sessionCatalog.archiveActive({
       ...ctx.sessionCatalogIdentity,
       now: Date.now(),
@@ -1362,14 +1373,15 @@ async function handlePs(_args: string, ctx: CommandContext): Promise<void> {
   }
 
   const rows: string[] = [
-    '| # | ID | Bot | 启动 |',
-    '|---|---|---|---|',
+    '| # | ID | Profile | Bot | 启动 |',
+    '|---|---|---|---|---|',
   ];
   for (const [idx, e] of live.entries()) {
     const ago = formatAgo(Date.now() - new Date(e.startedAt).getTime());
     const me = e.id === ctx.controls.processId ? ' ← 当前正在回复' : '';
     const bot = e.botName ? `${e.botName} (\`${e.appId}\`)` : `\`${e.appId}\``;
-    rows.push(`| ${idx + 1} | \`${e.id}\`${me} | ${bot} | ${ago} |`);
+    const profile = e.profileName ?? '-';
+    rows.push(`| ${idx + 1} | \`${e.id}\`${me} | \`${profile}\` | ${bot} | ${ago} |`);
   }
   const body = [
     `🧭 **当前有 ${live.length} 个 bot 在运行**`,
@@ -2205,6 +2217,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
   const card = configFormCard({
     messageReply: getMessageReplyMode(ctx.controls.cfg),
     showToolCalls: getShowToolCalls(ctx.controls.cfg),
+    showThinking: getShowThinking(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
@@ -2255,6 +2268,8 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       : 'card';
   const rawTools = String(fv.show_tool_calls ?? '').trim();
   const showToolCalls = rawTools !== 'hide';
+  const rawThinking = String(fv.show_thinking ?? '').trim();
+  const showThinking = rawThinking !== 'hide';
   // Parse max_concurrent_runs; invalid input falls back to current value.
   const rawMaxCC = String(fv.max_concurrent_runs ?? '').trim();
   const parsedMaxCC = Number(rawMaxCC);
@@ -2318,6 +2333,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       // explicitly picks any option gets out of the legacy-coerce path.
       messageReplyMigrated: true,
       showToolCalls,
+      showThinking,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
@@ -2362,6 +2378,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
     log.info('command', 'config-saved', {
       messageReply,
       showToolCalls,
+      showThinking,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
       requireMentionInGroup,
@@ -2377,6 +2394,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       configSavedCard({
         messageReply,
         showToolCalls,
+        showThinking,
         maxConcurrentRuns,
         runIdleTimeoutMinutes,
         requireMentionInGroup,

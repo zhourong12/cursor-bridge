@@ -2,5 +2,8 @@
 
 - **路径**：`D:\new-code\cursor-bridge`（`D:\new-code` 下子目录）
 - **飞书 `/cd`**：`/cd D:\new-code\cursor-bridge`
-- **启动**：`npm run lark-bridge:cursor` 或 `npm run lark-bridge:restart`（均会自动 build）
+- **三类服务**（Bot 运行时 / Console Electron / Console Web）见规则 `services.mdc`；**禁止** 把 Console 端口当成 Bot 数量
+- **Bot 单进程**：`npm run lark-bridge:cursor` 或 `restart.bat`
+- **Bot 多进程 Fleet**：`fleet-restart.bat` 或 `npm run lark-bridge:fleet-restart`
+- **Console 桌面**：`run-console.cmd` · **Console 浏览器**：`console-web.bat`
 - **bridge 源码**：本仓库 `src/`（非 vendor）

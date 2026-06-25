@@ -320,7 +320,18 @@ function formatStdout(
       const appId = fields.appId ? ` (${fields.appId})` : '';
       const agent = fields.agent ?? '-';
       const proc = fields.procId ? `  进程: ${fields.procId}` : '';
-      return `✓ 已连接  bot: ${bot}${appId}  agent: ${agent}${proc}`;
+      const fleetBits: string[] = [];
+      if (typeof fields.fleetOnline === 'number' && fields.fleetOnline > 0) {
+        fleetBits.push(`当前在线 ${fields.fleetOnline} 个 bot`);
+      }
+      if (typeof fields.fleetPeers === 'number' && fields.fleetPeers > 0) {
+        const names = typeof fields.fleetPeerNames === 'string' ? fields.fleetPeerNames : '';
+        fleetBits.push(
+          `Fleet 协作 ${fields.fleetPeers} 个${names ? ` (${names})` : ''}`,
+        );
+      }
+      const fleet = fleetBits.length > 0 ? `  · ${fleetBits.join('；')}` : '';
+      return `✓ 已连接  bot: ${bot}${appId}  agent: ${agent}${proc}${fleet}`;
     }
     if (event === 'reconnecting') return '↻ 正在重连…';
     if (event === 'reconnected') return '✓ 已重连';
