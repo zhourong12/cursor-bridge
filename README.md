@@ -2,8 +2,6 @@
 
 飞书/Lark 与 Cursor Agent 的桥接服务，支持在飞书里对话驱动本地 Agent，并内置 `/schedule` 进程内定时任务。
 
-基于 [lark-channel-bridge-cursor](https://github.com/mmnie-git/lark-channel-bridge-cursor) fork，源码在 `src/`。
-
 ## 前置
 
 - Node.js ≥ 20
