@@ -44,6 +44,10 @@ const RUN_POLL_MS = 100;
 const RUN_POLL_MAX_MS = 30_000;
 const MAX_RUN_ATTEMPTS = 2;
 const RETRY_BACKOFF_MS = 3000;
+/** Lightweight key-exchange probe timeout. Short so a stale connection fails fast
+ *  and triggers a fresh agent instead of blocking the run. */
+const CONNECTION_PROBE_TIMEOUT_MS =
+  parseInt(process.env.CURSOR_PROBE_TIMEOUT_MS ?? '', 10) || 8_000;
 
 export type CursorAgentCreate = (options: AgentOptions) => Promise<SDKAgent>;
 export type CursorAgentResume = (agentId: string, options?: Partial<AgentOptions>) => Promise<SDKAgent>;
@@ -168,12 +172,36 @@ export class CursorAdapter implements AgentAdapter {
       apiKey,
       modelSelection(opts.model ?? this.model ?? DEFAULT_CURSOR_MODEL),
     );
+
+    // Probe the SDK transport before acquiring an agent. A stale gRPC/HTTP2
+    // connection (server-side idle cleanup after ~15-44 min) surfaces as
+    // `[unauthenticated]` even with a valid key; resuming onto that dead
+    // connection fails every subsequent run until the process restarts.
+    // On probe failure we force a fresh agent create (skip resume) so the
+    // SDK builds a new connection instead of reusing the stale one.
+    let probeFailed = false;
+    try {
+      await probeCursorConnection(apiKey);
+    } catch (err) {
+      probeFailed = true;
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn('cursor', 'connection-probe-failed', {
+        errorKind: classifyCursorError(msg),
+        message: msg.slice(0, 240),
+        willForceFresh: true,
+      });
+    }
+
     let agent: SDKAgent | undefined;
     let cwd: string | undefined;
     let keepAgentAlive = false;
     let runOutcome: 'ok' | 'retry' | 'fatal' | 'aborted' = 'fatal';
     try {
-      const target = await this.resolveAgentTarget(apiKey, model, opts);
+      const target = await this.resolveAgentTarget(apiKey, model, {
+        ...opts,
+        // Probe said the transport is sick — don't resume onto a stale agent.
+        ...(probeFailed ? { sessionId: undefined } : {}),
+      });
       agent = target.agent;
       cwd = target.cwd;
       log.info('cursor', 'run-begin', {
@@ -434,6 +462,18 @@ async function resolveModelSelection(apiKey: string, model: ModelSelection): Pro
     /* keep caller selection */
   }
   return model;
+}
+
+/**
+ * Lightweight key-exchange probe. Hits `Cursor.models.list` with a short timeout
+ * to force a fresh gRPC handshake. When a long-lived SDK HTTP/2 connection has
+ * gone stale (server-side idle cleanup surfaces as `[unauthenticated]` /
+ * `Authentication error` even though the API key is valid), this probe fails
+ * fast and lets the caller force a fresh agent instead of resuming onto the
+ * dead connection. See Cursor forum threads on stale gRPC after ~15-44 min.
+ */
+async function probeCursorConnection(apiKey: string): Promise<void> {
+  await withTimeout(Cursor.models.list({ apiKey }), CONNECTION_PROBE_TIMEOUT_MS, 'connection-probe');
 }
 
 function delay(ms: number): Promise<void> {
