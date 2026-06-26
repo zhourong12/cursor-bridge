@@ -1,4 +1,5 @@
-import { Agent, Cursor, SqliteLocalAgentStore } from '@cursor/sdk';
+import { Agent, Cursor } from '@cursor/sdk';
+import { SqliteLocalAgentStore } from '@cursor/sdk/sqlite';
 import type {
   AgentOptions,
   ListAgentsOptions,

@@ -1,4 +1,5 @@
-import { Agent, SqliteLocalAgentStore, getDefaultSdkStateRoot } from '@cursor/sdk';
+import { Agent, getDefaultSdkStateRoot } from '@cursor/sdk';
+import { SqliteLocalAgentStore } from '@cursor/sdk/sqlite';
 import type { Run, SDKAgent } from '@cursor/sdk';
 
 import { log } from '../../core/logger';
