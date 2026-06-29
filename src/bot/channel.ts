@@ -90,6 +90,7 @@ import {
   tryDispatchReplyMentionsFromState,
 } from './outbound-mentions';
 import { startCursorWatchdog } from './cursor-watchdog';
+import { setAuthRestartContext } from '../agent/cursor/auth-failure-restart';
 import {
   bindBotRuntimeStats,
   createBotRuntimeStats,
@@ -231,6 +232,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   updateRuntimeObs();
   const runtimeObsTimer = setInterval(updateRuntimeObs, 30_000);
   runtimeObsTimer.unref();
+  if (agent.id === 'cursor') {
+    setAuthRestartContext({ profile: controls.profile });
+  }
   const cursorWatchdog =
     agent.id === 'cursor' && sessionCatalog
       ? startCursorWatchdog({

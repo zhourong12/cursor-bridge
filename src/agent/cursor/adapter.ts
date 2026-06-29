@@ -13,6 +13,7 @@ import type {
 } from '@cursor/sdk';
 
 import { log } from '../../core/logger';
+import { recordCursorRunOutcome } from './auth-failure-restart';
 import { classifyCursorError, secretFingerprint } from '../../core/diagnostics';
 import { TimeoutError, withTimeout } from '../../core/with-timeout';
 import { touchSelfHealStats } from '../../runtime/bot-runtime-stats';
@@ -45,11 +46,6 @@ const RUN_POLL_MS = 100;
 const RUN_POLL_MAX_MS = 30_000;
 const MAX_RUN_ATTEMPTS = 2;
 const RETRY_BACKOFF_MS = 3000;
-/** Lightweight key-exchange probe timeout. Short so a stale connection fails fast
- *  and triggers a fresh agent instead of blocking the run. */
-const CONNECTION_PROBE_TIMEOUT_MS =
-  parseInt(process.env.CURSOR_PROBE_TIMEOUT_MS ?? '', 10) || 8_000;
-
 export type CursorAgentCreate = (options: AgentOptions) => Promise<SDKAgent>;
 export type CursorAgentResume = (agentId: string, options?: Partial<AgentOptions>) => Promise<SDKAgent>;
 export type CursorAgentList = (options?: ListAgentsOptions) => Promise<ListResult<SDKAgentInfo>>;
@@ -174,35 +170,11 @@ export class CursorAdapter implements AgentAdapter {
       modelSelection(opts.model ?? this.model ?? DEFAULT_CURSOR_MODEL),
     );
 
-    // Probe the SDK transport before acquiring an agent. A stale gRPC/HTTP2
-    // connection (server-side idle cleanup after ~15-44 min) surfaces as
-    // `[unauthenticated]` even with a valid key; resuming onto that dead
-    // connection fails every subsequent run until the process restarts.
-    // On probe failure we force a fresh agent create (skip resume) so the
-    // SDK builds a new connection instead of reusing the stale one.
-    let probeFailed = false;
-    try {
-      await probeCursorConnection(apiKey);
-    } catch (err) {
-      probeFailed = true;
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn('cursor', 'connection-probe-failed', {
-        errorKind: classifyCursorError(msg),
-        message: msg.slice(0, 240),
-        willForceFresh: true,
-      });
-    }
-
     let agent: SDKAgent | undefined;
     let cwd: string | undefined;
-    let keepAgentAlive = false;
     let runOutcome: 'ok' | 'retry' | 'fatal' | 'aborted' = 'fatal';
     try {
-      const target = await this.resolveAgentTarget(apiKey, model, {
-        ...opts,
-        // Probe said the transport is sick — don't resume onto a stale agent.
-        ...(probeFailed ? { sessionId: undefined } : {}),
-      });
+      const target = await this.resolveAgentTarget(apiKey, model, opts);
       agent = target.agent;
       cwd = target.cwd;
       log.info('cursor', 'run-begin', {
@@ -226,7 +198,6 @@ export class CursorAdapter implements AgentAdapter {
       const runResult = yield* this.attemptRun(agent, target.cwd, prompt, runState);
 
       if (runResult === 'ok') {
-        keepAgentAlive = true;
         runOutcome = 'ok';
         return;
       }
@@ -257,7 +228,6 @@ export class CursorAdapter implements AgentAdapter {
           runOutcome = 'retry';
           return;
         }
-        keepAgentAlive = true;
         runOutcome = 'ok';
         return;
       }
@@ -273,16 +243,12 @@ export class CursorAdapter implements AgentAdapter {
     } finally {
       if (agent && cwd) {
         await releaseAgentRunLockIfTerminal(agent.agentId, cwd);
-        const dispose = !keepAgentAlive || runState.shouldStop();
         log.info('cursor', 'run-finish', {
           agentId: agent.agentId,
           outcome: runState.shouldStop() ? 'aborted' : runOutcome,
-          keepAgentAlive: keepAgentAlive && !runState.shouldStop(),
-          disposeAgent: dispose,
+          disposeAgent: true,
         });
-        if (dispose) {
-          await disposeAgent(agent);
-        }
+        await disposeAgent(agent);
       }
     }
   }
@@ -333,6 +299,7 @@ export class CursorAdapter implements AgentAdapter {
       return 'fatal';
     }
     if (result.status !== 'error') {
+      recordCursorRunOutcome({ ok: true });
       yield terminalEvent(agent.agentId, result);
       return 'ok';
     }
@@ -341,12 +308,14 @@ export class CursorAdapter implements AgentAdapter {
       ? await readRunErrorDetail(cwd, agent.agentId, run.id)
       : undefined;
     const failText = result.result?.trim() || errorDetail || '';
+    const errorKind = classifyCursorError(failText);
     log.warn('cursor', 'run-error', {
       agentId: agent.agentId,
       runId: run.id,
-      errorKind: classifyCursorError(failText),
+      errorKind,
       sawOutput,
     });
+    recordCursorRunOutcome({ ok: false, errorKind, sawOutput });
     if (!sawOutput && isRetryableRunError(result.result?.trim() || errorDetail)) {
       return 'retryable';
     }
@@ -463,18 +432,6 @@ async function resolveModelSelection(apiKey: string, model: ModelSelection): Pro
     /* keep caller selection */
   }
   return model;
-}
-
-/**
- * Lightweight key-exchange probe. Hits `Cursor.models.list` with a short timeout
- * to force a fresh gRPC handshake. When a long-lived SDK HTTP/2 connection has
- * gone stale (server-side idle cleanup surfaces as `[unauthenticated]` /
- * `Authentication error` even though the API key is valid), this probe fails
- * fast and lets the caller force a fresh agent instead of resuming onto the
- * dead connection. See Cursor forum threads on stale gRPC after ~15-44 min.
- */
-async function probeCursorConnection(apiKey: string): Promise<void> {
-  await withTimeout(Cursor.models.list({ apiKey }), CONNECTION_PROBE_TIMEOUT_MS, 'connection-probe');
 }
 
 function delay(ms: number): Promise<void> {
