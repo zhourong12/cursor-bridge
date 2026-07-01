@@ -19,6 +19,7 @@
     "restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/restart-lark-bridge.ps1",
     "restart:build": "npm run build && npm run restart",
     "lark-bridge:cursor": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-lark-bridge.ps1",
+    "lark-bridge:cursor:mac": "npm run build && bash ./start-mac.sh",
     "lark-bridge:restart": "npm run restart:build",
     "lark-bridge:status": "lark-channel-bridge status",
     "fleet:start": "lark-channel-bridge fleet start --all",
